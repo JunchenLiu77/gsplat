@@ -20,6 +20,11 @@ class MLP(nn.Module):
             if activation == "relu"
             else nn.Tanh() if activation == "tanh" else nn.Identity()
         )
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_uniform_(m.weight, nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
         x = self.act(self.fc1(x))
@@ -119,39 +124,76 @@ class GMConv(nn.Module):
             torch.zeros(self.Nk, self.Nc, self.D, device=self.device)
         )  # [Nk, Nc, D]
         self.scales = nn.Parameter(
-            torch.full((self.Nk, self.Nc, self.D), 1e-4, device=self.device)
+            torch.full((self.Nk, self.Nc, self.D), -10.0, device=self.device)
         )  # [Nk, Nc, D]
-        self.quats = nn.Parameter(
-            torch.randn(self.Nk, self.Nc, 4, device=self.device)
-        )  # [Nk, Nc, 4]
+        if self.D != 1:
+            if self.D == 3:
+                self.quats = nn.Parameter(
+                    torch.randn(self.Nk, self.Nc, 4, device=self.device)
+                )  # [Nk, Nc, 4]
+            elif self.D == 2:
+                self.angles = nn.Parameter(
+                    torch.randn(self.Nk, self.Nc, device=self.device)
+                )  # [Nk, Nc]
+            else:
+                raise NotImplementedError(self.D)
         self.features = nn.Parameter(torch.randn(self.Nk, device=self.device))  # [Nk,]
 
-        self.weights_mlp = MLP(self.Nk, self.Nk // 2, mlp_depth, 1, activation="relu")
-        self.means_mlp = MLP(self.Nk, self.Nk // 2, mlp_depth, 1, activation="none")
-        self.covars_mlp = MLP(self.Nk, self.Nk // 2, mlp_depth, 1, activation="none")
+        self.interp_weights = nn.Parameter(torch.ones(self.Nk, device=self.device))
+        # self.weights_mlp = MLP(self.Nk, self.Nk // 2, mlp_depth, 1, activation="relu")
         # self.features_mlp = MLP(self.Nk, self.Nk // 2, mlp_depth, 1, activation="relu")
 
     def forward(
         self,
-        weights: torch.Tensor,  # [Ni]
-        means: torch.Tensor,  # [Ni, D]
-        covars: torch.Tensor,  # [Ni, D, D]
-        features: torch.Tensor,  # [Ni, Nf]
+        input,
     ) -> torch.Tensor:
+
+        weights = input["weights"]
+        means = input["means"]
+        covars = input["covars"]
+        features = input["features"]
 
         Ni, Nf = features.shape
         assert weights.shape == (Ni,), weights.shape
         assert means.shape == (Ni, self.D), means.shape
         assert covars.shape == (Ni, self.D, self.D), covars.shape
 
-        kernel_covars, _ = quat_scale_to_covar_preci(
-            self.quats.reshape(-1, 4),
-            self.scales.reshape(-1, self.D),
-            compute_preci=False,
-        )  # [Nk * Nc, D, D]
-        kernel_covars = kernel_covars.reshape(
-            self.Nk, self.Nc, self.D, self.D
-        )  # [Nk, Nc, D, D]
+        if self.D == 3:
+            kernel_covars, _ = quat_scale_to_covar_preci(
+                self.quats.reshape(-1, 4),
+                torch.exp(self.scales).reshape(-1, self.D),
+                compute_preci=False,
+            )  # [Nk * Nc, D, D]
+            kernel_covars = kernel_covars.reshape(
+                self.Nk, self.Nc, self.D, self.D
+            )  # [Nk, Nc, D, D]
+        elif self.D == 2:
+            R = torch.stack(
+                [
+                    torch.cos(self.angles),
+                    torch.sin(self.angles),
+                    -torch.sin(self.angles),
+                    torch.cos(self.angles),
+                ],
+                dim=-1,
+            ).reshape(
+                -1, 2, 2
+            )  # [Nk * Nc, D, D]
+            kernel_covars = torch.bmm(
+                R,
+                torch.bmm(
+                    torch.diag_embed(torch.exp(self.scales) ** 2).reshape(
+                        -1, self.D, self.D
+                    ),
+                    R.transpose(1, 2),
+                ),
+            ).reshape(
+                self.Nk, self.Nc, self.D, self.D
+            )  # [Nk, Nc, D, D]
+        elif self.D == 1:
+            kernel_covars = torch.exp(self.scales.unsqueeze(-1)) ** 2  # [Nk, Nc, D, D]
+
+        # G(w, m, c) * G(w', m', c') = G(w * w', m + m', c + c')
         conv_weights = (
             self.weights.unsqueeze(0) * weights[:, None, None]
         )  # [Ni, Nk, Nc]
@@ -165,18 +207,25 @@ class GMConv(nn.Module):
             conv_weights, conv_means, conv_covars, reduction="merge", dim=2
         )  # [Ni, Nk], [Ni, Nk, D], [Ni, Nk, D, D]
 
-        # reduced_features = (
-        #     features[:, None, :] * self.features[None, None, :]
-        # )  # [Ni, Nk, Nf]
-        weights_ = self.weights_mlp(reduced_weights)[:, 0]  # [Ni]
-        means_ = self.means_mlp(reduced_means.permute(0, 2, 1))[:, :, 0]  # [Ni, D]
-        covars_ = self.covars_mlp(reduced_covars.permute(0, 2, 3, 1))[
-            :, :, :, 0
-        ]  # [Ni, D, D]
+        # means, covars are weighted averages of the reduced gaussians
+        # weights_ = self.weights_mlp(reduced_weights)[:, 0]  # [Ni]
+
+        interp_weights_ = torch.softmax(self.interp_weights, dim=0)  # [Nk]
+        weights_ = (interp_weights_[None, :] * reduced_weights).sum(dim=1)
+        means_ = (interp_weights_[None, :, None] * reduced_means).sum(dim=1)  # [Nk, D]
+        covars_ = (interp_weights_[None, :, None, None] * reduced_covars).sum(
+            dim=1
+        )  # [Nk, D, D]
 
         # features_ = self.features_mlp(reduced_features.permute(0, 2, 1))  # [Ni, Nf]
         features_ = features  # TODO: reduce features
-        return weights_, means_, covars_, features_
+        output = {
+            "weights": weights_,
+            "means": means_,
+            "covars": covars_,
+            "features": features_,
+        }
+        return output
 
 
 if __name__ == "__main__":
@@ -186,12 +235,12 @@ if __name__ == "__main__":
     Nk = 16
     Nc = 8
     mlp_depth = 4
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    conv = GMConv(Nk, Nc, mlp_depth, D).to(device)
+
+    gm_conv = GMConv(Nk, Nc, mlp_depth, D).to(device)
     weights = torch.randn(N, device=device)
     means = torch.randn(N, D, device=device)
     covars = torch.randn(N, D, D, device=device)
     features = torch.randn(N, Nf, device=device)
-    weights_, means_, covars_, features_ = conv(weights, means, covars, features)
+    weights_, means_, covars_, features_ = gm_conv(weights, means, covars, features)
     print(weights_.shape, means_.shape, covars_.shape, features_.shape)

@@ -9,7 +9,7 @@ from signals import SIGNALS_2D
 from sklearn import mixture
 
 
-def plot_results(ax, X, Y, means, covariances, title):
+def _plot_results(ax, X, Y, means, covariances, title):
     color_iter = itertools.cycle(["navy", "c", "cornflowerblue", "gold", "darkorange"])
     for i, (mean, covar, color) in enumerate(zip(means, covariances, color_iter)):
         v, w = linalg.eigh(covar)
@@ -55,13 +55,15 @@ for i, (signal_name, signal_func) in enumerate(SIGNALS_2D.items()):
         "weights": gmm.weights_,
         "means": gmm.means_,
         "covariances": gmm.covariances_,
+        "x": x,
+        "y": y,
     }
 
     # Plot original signal
     axs[row, col].plot(x, y, label="Original Signal")
 
     # Plot GMM results
-    plot_results(
+    _plot_results(
         axs[row, col], X, gmm.predict(X), gmm.means_, gmm.covariances_, signal_name
     )
     axs[row, col].legend()
