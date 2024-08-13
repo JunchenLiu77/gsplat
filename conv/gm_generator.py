@@ -48,7 +48,7 @@ for i, (signal_name, signal_func) in enumerate(SIGNALS_2D.items()):
 
     # Fit a Gaussian mixture with EM using ten components
     gmm = mixture.GaussianMixture(
-        n_components=100, covariance_type="full", max_iter=10000
+        n_components=50, covariance_type="full", max_iter=10000
     ).fit(X)
 
     gmm_params[signal_name] = {

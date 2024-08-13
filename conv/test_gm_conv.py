@@ -10,13 +10,14 @@ from ipdb import set_trace
 from signals import SIGNALS_2D
 
 
-def _plot_gmm_results(ax, X, weights, means, covars, iter_num):
+def _plot_gmm_results(ax, X, Y, weights, means, covars, iter_num):
     color_iter = itertools.cycle(["navy", "c", "cornflowerblue", "gold", "darkorange"])
 
     with torch.no_grad():
         for i, (weight, mean, covar, color) in enumerate(
             zip(weights, means, covars, color_iter)
         ):
+            print(i)
             mean = mean.cpu().numpy()
             covar = covar.cpu().numpy()
 
@@ -26,6 +27,7 @@ def _plot_gmm_results(ax, X, weights, means, covars, iter_num):
 
             # Plot data points (assuming we have labels, if not, adjust accordingly)
             ax.scatter(X[:, 0], X[:, 1], 0.8)
+            ax.scatter(Y[:, 0], Y[:, 1], 0.8)
 
             # Plot ellipse
             angle = np.arctan2(u[1], u[0])
@@ -103,104 +105,71 @@ def _eval_gmm(weights, means, covars, x):
     return gmm_eval
 
 
-def convert_signals_2d(src_signal, tar_signal, params_path, device, model, method):
+def conv_2gm(src_signal, tar_signal, params_path, device):
     assert src_signal in SIGNALS_2D, src_signal
     assert tar_signal in SIGNALS_2D, tar_signal
-    assert method in ["conv", "fit"], method
 
     # Load GMM parameters
     with open(params_path, "rb") as f:
         gmm_params = pickle.load(f)
 
-    if method == "fit":
-        src_weights = torch.nn.Parameter(
-            torch.tensor(
-                gmm_params[src_signal]["weights"], dtype=torch.float, device=device
-            )
-        )
-        src_means = torch.nn.Parameter(
-            torch.tensor(
-                gmm_params[src_signal]["means"], dtype=torch.float, device=device
-            )
-        )
-        N = src_weights.shape[0]
-        src_scales = torch.nn.Parameter(torch.full((N, 2), -3.0, device=device))
-        src_angles = torch.nn.Parameter(torch.zeros(N, device=device))
-    else:
-        src_weights = torch.tensor(
+    src_weights = torch.nn.Parameter(
+        torch.tensor(
             gmm_params[src_signal]["weights"], dtype=torch.float, device=device
         )
-        src_means = torch.tensor(
-            gmm_params[src_signal]["means"], dtype=torch.float, device=device
-        )
-        src_covars = torch.tensor(
+    )
+    src_means = torch.nn.Parameter(
+        torch.tensor(gmm_params[src_signal]["means"], dtype=torch.float, device=device)
+    )
+    src_covars = torch.nn.Parameter(
+        torch.tensor(
             gmm_params[src_signal]["covariances"], dtype=torch.float, device=device
         )
+    )
+    src_x = torch.tensor(gmm_params[src_signal]["x"], dtype=torch.float, device=device)
+    src_y = torch.tensor(gmm_params[src_signal]["y"], dtype=torch.float, device=device)
+    X = torch.stack((src_x, src_y), dim=1).cpu().numpy()
 
+    tar_weights = torch.nn.Parameter(
+        torch.tensor(
+            gmm_params[tar_signal]["weights"], dtype=torch.float, device=device
+        )
+    )
+    tar_means = torch.nn.Parameter(
+        torch.tensor(gmm_params[tar_signal]["means"], dtype=torch.float, device=device)
+    )
+    tar_covars = torch.nn.Parameter(
+        torch.tensor(
+            gmm_params[tar_signal]["covariances"], dtype=torch.float, device=device
+        )
+    )
     tar_x = torch.tensor(gmm_params[tar_signal]["x"], dtype=torch.float, device=device)
     tar_y = torch.tensor(gmm_params[tar_signal]["y"], dtype=torch.float, device=device)
-    X = torch.stack((tar_x, tar_y), dim=1).cpu().numpy()
+    Y = torch.stack((tar_x, tar_y), dim=1).cpu().numpy()
 
-    # Convert the source signal to the target signal
-    if method == "fit":
-        optimizer = torch.optim.Adam(
-            [
-                {"params": src_weights, "lr": 1e-4},
-                {"params": src_means, "lr": 1e-2},
-                {"params": src_scales, "lr": 1e-4},
-                {"params": src_angles, "lr": 1e-4},
-            ],
+    conv_weights = torch.empty((src_weights.shape[0] * tar_weights.shape[0],))
+    conv_means = torch.empty(
+        (src_means.shape[0] * tar_means.shape[0], src_means.shape[1])
+    )
+    conv_covars = torch.empty(
+        (
+            src_covars.shape[0] * tar_covars.shape[0],
+            src_covars.shape[1],
+            src_covars.shape[2],
         )
-    else:
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    for iter in range(10000):
-        if method == "fit":
-            R = torch.stack(
-                [
-                    torch.cos(src_angles),
-                    torch.sin(src_angles),
-                    -torch.sin(src_angles),
-                    torch.cos(src_angles),
-                ],
-                dim=-1,
-            ).reshape(-1, 2, 2)
-            src_covars = torch.bmm(
-                R,
-                torch.bmm(
-                    torch.diag_embed(torch.exp(src_scales) ** 2), R.transpose(1, 2)
-                ),
-            )
-            weights, means, covars = src_weights, src_means, src_covars
-        else:
-            input = {
-                "weights": src_weights,
-                "means": src_means,
-                "covars": src_covars,
-                "features": torch.rand(src_weights.shape[0], 1, device=device),
-            }
-            output = model(input)
-            weights, means, covars = (
-                output["weights"],
-                output["means"],
-                output["covars"],
-            )
-            weights = torch.softmax(weights, dim=0)
+    )
+    for i in range(src_weights.shape[0]):
+        for j in range(tar_weights.shape[0]):
+            conv_weights[i * tar_weights.shape[0] + j] = src_weights[i] * tar_weights[j]
+            conv_means[i * tar_means.shape[0] + j] = src_means[i] + tar_means[j]
+            conv_covars[i * tar_covars.shape[0] + j] = src_covars[i] + tar_covars[j]
 
-        # calculate the probability of the target signal
-        prob = _eval_gmm(weights, means, covars, torch.stack((tar_x, tar_y), dim=1))
-        loss = -torch.log(prob.clamp(1e-10)).mean()
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        print(f"Iter: {iter}, Loss: {loss.item()}")
-
-        # plot the target signal and current GM
-        if iter % 200 == 0:
-            fig, ax = plt.subplots(figsize=(10, 8))
-            _plot_gmm_results(ax, X, weights, means, covars, iter)
-            plt.savefig(f"gm_from_{src_signal}_to_{tar_signal}.png")
-            plt.close(fig)
-    set_trace()
+    print("conv done.")
+    # Plot the result gmm
+    fig, ax = plt.subplots(figsize=(10, 8))
+    _plot_gmm_results(ax, X, Y, conv_weights, conv_means, conv_covars, 0)
+    plt.savefig(f"gm_conv_{src_signal}_and_{tar_signal}.png")
+    plt.close(fig)
 
 
 if __name__ == "__main__":
@@ -212,22 +181,15 @@ if __name__ == "__main__":
     num_conv_layers = 4
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     params_path = "gmm_params.pkl"
-    # signal type: sine_wave, square_wave, chirp_signal, gaussian_pulse,
-    # white_noise, step_function, sawtooth_wave, triangle_wave,
-    # exponential_decay, rectified_sine_wave, am_signal, fm_signal
-    src_signal = "exponential_decay"
-    tar_signal = "am_signal"
-    method = "conv"
 
     layers = []
     for i in range(num_conv_layers):
         layers.append(GMConv(Nk, Nc, mlp_depth, D))
     model = torch.nn.Sequential(*layers).to(device)
-    convert_signals_2d(
-        src_signal=src_signal,
-        tar_signal=tar_signal,
+    # model = GMConv(Nk, Nc, mlp_depth, D).to(device)
+    conv_2gm(
+        src_signal="sine_wave",
+        tar_signal="fm_signal",
         params_path=params_path,
         device=device,
-        model=model,
-        method=method,
     )
