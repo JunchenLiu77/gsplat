@@ -157,8 +157,8 @@ class Config:
     lpips_net: Literal["vgg", "alex"] = "alex"
 
     # Tetra
-    enable_culling: bool = True
-    opt_vert: bool = False # optimize tet vertices directly
+    enable_culling: bool = False
+    opt_vert: bool = False  # optimize tet vertices directly
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -234,8 +234,9 @@ def create_splats_with_optimizers(
         tscales = torch.log(dist_avg * init_scale * 3.0)  # 6 sigma [N,]
         tquats = torch.rand((N, 4))  # [N, 4]
 
-        if cfg.opt_vert:            
+        if cfg.opt_vert:
             from gsplat.cuda._torch_impl import _quat_scale_to_matrix
+
             tvertices = torch.tensor(
                 [
                     [math.sqrt(8 / 9), 0, -1 / 3],
@@ -244,7 +245,9 @@ def create_splats_with_optimizers(
                     [0, 0, 1],
                 ],
             )  # [4, 3]
-            rotmats = _quat_scale_to_matrix(tquats, torch.exp(tscales)[:, None])  # [N, 3, 3]
+            rotmats = _quat_scale_to_matrix(
+                tquats, torch.exp(tscales)[:, None]
+            )  # [N, 3, 3]
             tvertices = torch.einsum("nij,kj->nki", rotmats, tvertices)  # [N, 4, 3]
 
             # Local space tvertices
@@ -477,7 +480,9 @@ class Runner:
         if self.cfg.enable_culling:
             if self.cfg.opt_vert:
                 tscales = tquats = None
-                tvertices = self.splats["tvertices"] + self.splats["means"][:, None, :]  # [N, 4, 3]
+                tvertices = (
+                    self.splats["tvertices"] + self.splats["means"][:, None, :]
+                )  # [N, 4, 3]
             else:
                 tscales = torch.exp(self.splats["tscales"])  # [N,]
                 tquats = self.splats["tquats"]  # [N, 4]
@@ -716,7 +721,9 @@ class Runner:
                 if cfg.opt_vert:
                     desc += f"ts: {torch.linalg.norm(self.splats['tvertices'], dim=-1).mean().item():.3f}| "
                 else:
-                    desc += f"ts: {torch.exp(self.splats['tscales']).mean().item():.3f}| "
+                    desc += (
+                        f"ts: {torch.exp(self.splats['tscales']).mean().item():.3f}| "
+                    )
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
