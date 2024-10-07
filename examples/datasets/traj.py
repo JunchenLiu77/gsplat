@@ -40,6 +40,30 @@ def average_pose(poses: np.ndarray) -> np.ndarray:
     return cam2world
 
 
+def generate_generic_spiral_path(
+    n_frames: int = 120,
+    radii: float = 1.0,
+):
+    render_poses = []
+    golden_ratio = (1 + np.sqrt(5)) / 2
+    i = np.arange(0, n_frames)
+    theta = 2 * np.pi * i / golden_ratio
+    phi = np.arccos(np.clip(1 - 2 * i / n_frames, -1, 1))
+    x = radii * np.cos(theta) * np.sin(phi)
+    y = radii * np.sin(theta) * np.sin(phi)
+    z = radii * np.cos(phi)
+
+    for idx in range(n_frames):
+        position = np.array([x[idx], y[idx], z[idx]])
+        up = np.array([0.0, 0.0, 1.0])
+
+        lookdir = -position
+        cam_to_world = viewmatrix(lookdir, up, position)
+        render_poses.append(cam_to_world)
+    render_poses = np.array(render_poses)
+    return render_poses
+
+
 def generate_spiral_path(
     poses,
     bounds,

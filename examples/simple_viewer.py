@@ -23,8 +23,10 @@ from gsplat._helper import load_test_data
 from gsplat.distributed import cli
 from gsplat.rendering import _rasterization, rasterization
 
+SINGLE_CUBE: bool = True
 SINGLE_GS: bool = False
 CULLING: bool = True
+
 
 def main(local_rank: int, world_rank, world_size: int, args):
     torch.manual_seed(42)
@@ -190,17 +192,61 @@ def main(local_rank: int, world_rank, world_size: int, args):
         else:
             raise ValueError
 
-        if SINGLE_GS:
-            indices = [3]
+        if not SINGLE_CUBE:
+            if SINGLE_GS:
+                indices = [3]
+            else:
+                indices = ...
+            means = means[indices]
+            quats = quats[indices]
+            scales = scales[indices] * 10
+            opacities = opacities[indices] * 0 + 1
+            colors = colors[indices]
+            tquats = tquats[indices]
+            tscales = tscales[indices]
+            tvertices = None
         else:
-            indices = ...
+            # ----- render a cube -----
+            N = 5
+            means = torch.zeros((N, 3), device=device)
+            quats = torch.ones((N, 4), device=device)
+            scales = torch.full((N, 3), 1.0, device=device)
+            opacities = torch.full((N,), 1.0, device=device)
+            colors = torch.ones(1, 3, device=device).repeat(N, 1)
+            tquats = None
+            tscales = None
 
+            verts = torch.tensor(
+                [
+                    [-1.0, -1.0, -1.0],
+                    [1.0, -1.0, -1.0],
+                    [-1.0, 1.0, -1.0],
+                    [1.0, 1.0, -1.0],
+                    [-1.0, -1.0, 1.0],
+                    [1.0, -1.0, 1.0],
+                    [-1.0, 1.0, 1.0],
+                    [1.0, 1.0, 1.0],
+                ],
+                device=device,
+            )
+            indices = torch.tensor(
+                [
+                    [0, 1, 2, 4],
+                    [1, 2, 3, 7],
+                    [1, 2, 4, 7],
+                    [1, 4, 5, 7],
+                    [2, 4, 6, 7],
+                ],
+                device=device,
+            )
+            tvertices = verts[indices]
+            # ---------------------------
         render_colors, render_alphas, meta = rasterization_fn(
-            means[indices],  # [N, 3]
-            quats[indices],  # [N, 4]
-            scales[indices] * 10,  # [N, 3]
-            opacities[indices] * 0 + 1,  # [N]
-            colors[indices],  # [N, 3]
+            means,  # [N, 3]
+            quats,  # [N, 4]
+            scales,  # [N, 3]
+            opacities,  # [N]
+            colors,  # [N, 3]
             viewmat[None],  # [1, 4, 4]
             K[None],  # [1, 3, 3]
             width,
@@ -211,8 +257,9 @@ def main(local_rank: int, world_rank, world_size: int, args):
             radius_clip=3,
             packed=False,
             enable_culling=CULLING,
-            tquats=tquats[indices],
-            tscales=tscales[indices],
+            tquats=tquats,
+            tscales=tscales,
+            tvertices=tvertices,
         )
         render_rgbs = render_colors[0, ..., 0:3].cpu().numpy()
         return render_rgbs
@@ -250,5 +297,6 @@ if __name__ == "__main__":
     parser.add_argument("--backend", type=str, default="gsplat", help="gsplat, inria")
     args = parser.parse_args()
     assert args.scene_grid % 2 == 1, "scene_grid must be odd"
+    assert not (SINGLE_CUBE and SINGLE_GS), "cannot render both cube and gs"
 
     cli(main, args, verbose=True)
