@@ -156,14 +156,67 @@ def split(
             p_split = torch.logit(new_opacities).repeat(repeats)  # [2N]
         elif name == "tscales":
             tscales = torch.exp(p[sel])
-            p_split = torch.log(tscales / 1.6).repeat(repeats)  # [2N, 3] 
+            p_split = torch.log(tscales / 1.6).repeat(repeats)  # [2N, 3]
         # elif name == "tvertices":
         #     assert p.dim() == 3 and p.shape[-2:] == (4, 3)
         #     p_split = p[sel]
         #     p_center = p_split.mean(dim=1, keepdim=True)
         #     p_split = (p_split - p_center) / 1.6 + p_center # centering
-        #     p_split = p_split.repeat(repeats)  # [2N, 4, 3] 
+        #     p_split = p_split.repeat(repeats)  # [2N, 4, 3]
         else:
+            p_split = p[sel].repeat(repeats)
+        p_new = torch.cat([p[rest], p_split])
+        p_new = torch.nn.Parameter(p_new)
+        return p_new
+
+    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+        v_split = torch.zeros((2 * len(sel), *v.shape[1:]), device=device)
+        return torch.cat([v[rest], v_split])
+
+    # update the parameters and the state in the optimizers
+    _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
+    # update the extra running state
+    for k, v in state.items():
+        if isinstance(v, torch.Tensor):
+            repeats = [2] + [1] * (v.dim() - 1)
+            v_new = v[sel].repeat(repeats)
+            state[k] = torch.cat((v[rest], v_new))
+
+
+@torch.no_grad()
+def cut(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, Tensor],
+    mask: Tensor,
+):
+    """Inplace cut the Gaussian with the given mask. Only operate on tet vertices.
+
+    Args:
+        params: A dictionary of parameters.
+        optimizers: A dictionary of optimizers, each corresponding to a parameter.
+        mask: A boolean mask to split the Gaussians.
+    """
+    device = mask.device
+    sel = torch.where(mask)[0]
+    rest = torch.where(~mask)[0]
+
+    def param_fn(name: str, p: Tensor) -> Tensor:
+        repeats = [2] + [1] * (p.dim() - 1)
+        if name == "tvertices":
+            assert p.dim() == 3 and p.shape[-2:] == (4, 3)
+            # [0, 1, 2, 3] -> [0, 1, 2, 4] + [1, 2, 3, 4]
+            p_split = p[sel]
+            ids0 = torch.tensor([0, 1, 2], device=device)
+            ids1 = torch.tensor([1, 2, 3], device=device)
+            p0 = p_split[:, ids0, :]  # [N, 3, 3]
+            p1 = p_split[:, ids1, :]  # [N, 3, 3]
+            pt = torch.randn(p0.shape[0], 1, 3, device=device)  # [N, 1, 3]
+            p0 = torch.cat((p0, pt), dim=1)  # [N, 4, 3]
+            p1 = torch.cat((p1, pt), dim=1)  # [N, 4, 3]
+            p_split = torch.cat((p0, p1), dim=0)  # [2N, 4, 3]
+        else:
+            # use the same gaussian, only change the bounding tet
             p_split = p[sel].repeat(repeats)
         p_new = torch.cat([p[rest], p_split])
         p_new = torch.nn.Parameter(p_new)

@@ -35,7 +35,7 @@ from gsplat.compression import PngCompression
 from gsplat.cuda._torch_impl import _quat_scale_to_matrix
 from gsplat.distributed import cli
 from gsplat.rendering import _rasterization, rasterization
-from gsplat.strategy import DefaultStrategy, MCMCStrategy
+from gsplat.strategy import DefaultStrategy, MCMCStrategy, TetStrategy
 
 
 @dataclass
@@ -104,7 +104,7 @@ class Config:
     far_plane: float = 1e10
 
     # Strategy for GS densification
-    strategy: Union[DefaultStrategy, MCMCStrategy] = field(
+    strategy: Union[DefaultStrategy, MCMCStrategy, TetStrategy] = field(
         default_factory=DefaultStrategy
     )
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
@@ -158,10 +158,10 @@ class Config:
     lpips_net: Literal["vgg", "alex"] = "alex"
 
     # Tetra
-    enable_culling: bool = True
+    enable_culling: bool = False
     opt_vert: bool = False  # optimize tet vertices directly
     t_init_s: float = 6.0  # initial scale of tet
-    t_lr_v: float = 1e-3  # learning rate for tet vertices
+    t_lr_v: float = 1e-4  # learning rate for tet vertices
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -176,6 +176,10 @@ class Config:
             strategy.reset_every = int(strategy.reset_every * factor)
             strategy.refine_every = int(strategy.refine_every * factor)
         elif isinstance(strategy, MCMCStrategy):
+            strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
+            strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
+            strategy.refine_every = int(strategy.refine_every * factor)
+        elif isinstance(strategy, TetStrategy):
             strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
             strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
             strategy.refine_every = int(strategy.refine_every * factor)
@@ -367,6 +371,8 @@ class Runner:
                 scene_scale=self.scene_scale
             )
         elif isinstance(self.cfg.strategy, MCMCStrategy):
+            self.strategy_state = self.cfg.strategy.initialize_state()
+        elif isinstance(self.cfg.strategy, TetStrategy):
             self.strategy_state = self.cfg.strategy.initialize_state()
         else:
             assert_never(self.cfg.strategy)
@@ -823,6 +829,15 @@ class Runner:
                     info=info,
                     lr=schedulers[0].get_last_lr()[0],
                 )
+            elif isinstance(self.cfg.strategy, TetStrategy):
+                self.cfg.strategy.step_post_backward(
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info,
+                    packed=cfg.packed,
+                )
             else:
                 assert_never(self.cfg.strategy)
 
@@ -1128,6 +1143,12 @@ if __name__ == "__main__":
                 opacity_reg=0.01,
                 scale_reg=0.01,
                 strategy=MCMCStrategy(verbose=True),
+            ),
+        ),
+        "tet": (
+            "Gaussian splatting training using densification heuristics from the original paper.",
+            Config(
+                strategy=TetStrategy(verbose=True),
             ),
         ),
     }
