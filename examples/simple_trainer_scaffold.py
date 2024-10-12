@@ -185,7 +185,6 @@ def create_splats_with_optimizers(
     points = points[world_rank::world_size]
     scales = scales[world_rank::world_size]
     N = points.shape[0]
-    quats = torch.rand((N, 4))  # [N, 4]
 
     features = torch.zeros((N, cfg.feat_dim))
     offsets = torch.zeros((N, cfg.n_feat_offsets, 3))
@@ -217,21 +216,21 @@ def create_splats_with_optimizers(
 
     # Define the MLPs (decoders)
     colors_mlp: torch.nn.Sequential = torch.nn.Sequential(
-        torch.nn.Linear(cfg.feat_dim + 3, cfg.feat_dim),
+        torch.nn.Linear(cfg.feat_dim, cfg.feat_dim),
         torch.nn.ReLU(True),
         torch.nn.Linear(cfg.feat_dim, 3 * cfg.n_feat_offsets),
         torch.nn.Sigmoid(),
     ).cuda()
 
     opacities_mlp: torch.nn.Sequential = torch.nn.Sequential(
-        torch.nn.Linear(cfg.feat_dim + 3, cfg.feat_dim),
+        torch.nn.Linear(cfg.feat_dim, cfg.feat_dim),
         torch.nn.ReLU(True),
         torch.nn.Linear(cfg.feat_dim, cfg.n_feat_offsets),
         torch.nn.Tanh(),
     ).cuda()
 
     scale_rot_mlp: torch.nn.Sequential = torch.nn.Sequential(
-        torch.nn.Linear(cfg.feat_dim + 3, cfg.feat_dim),
+        torch.nn.Linear(cfg.feat_dim, cfg.feat_dim),
         torch.nn.ReLU(True),
         torch.nn.Linear(cfg.feat_dim, 7 * cfg.n_feat_offsets),
     ).cuda()
@@ -446,26 +445,23 @@ class Runner:
         vis_offsets = self.splats["gauss_params"]["offsets"][visible_anchor_mask]  # [M, k, 3]
         vis_scales = self.splats["gauss_params"]["scales"][visible_anchor_mask].exp()  # [M, 3]
 
-        # See formula (5) in Scaffold-GS
-        cam_pos = camtoworlds[:, :3, 3]
-        view_dir = vis_anchors - cam_pos  # [M, 3]
-        length = view_dir.norm(dim=1, keepdim=True)
-        view_dir_normalized = view_dir / length  # [M, 3]
-
-        # See formula (9) and the appendix for the rest
-        feature_view_dir = torch.cat([vis_features, view_dir_normalized], dim=1)  # [M, c+3]
+        # remove view direction here
+        # cam_pos = camtoworlds[:, :3, 3]
+        # view_dir = vis_anchors - cam_pos  # [M, 3]
+        # length = view_dir.norm(dim=1, keepdim=True)
+        # view_dir_normalized = view_dir / length  # [M, 3]
 
         # Apply MLPs (they output per-offset features concatenated along the last dimension)
-        neural_opacity = self.splats["decoders"]["opacities_mlp"](feature_view_dir)  # [M, k*1]
+        neural_opacity = self.splats["decoders"]["opacities_mlp"](vis_features)  # [M, k*1]
         neural_opacity = neural_opacity.view(-1, 1)  # [M*k, 1]
         neural_selection_mask = (neural_opacity > 0.0).view(-1)  # [M*k]
 
         # Get color and reshape
-        neural_colors = self.splats["decoders"]["colors_mlp"](feature_view_dir)  # [M, k*3]
+        neural_colors = self.splats["decoders"]["colors_mlp"](vis_features)  # [M, k*3]
         neural_colors = neural_colors.view(-1, 3)  # [M*k, 3]
 
         # Get scale and rotation and reshape
-        neural_scale_rot = self.splats["decoders"]["scale_rot_mlp"](feature_view_dir)  # [M, k*7]
+        neural_scale_rot = self.splats["decoders"]["scale_rot_mlp"](vis_features)  # [M, k*7]
         neural_scale_rot = neural_scale_rot.view(-1, 7)  # [M*k, 7]
 
         # Reshape vis_offsets, scales, and anchors
