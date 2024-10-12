@@ -179,7 +179,7 @@ def create_splats_with_optimizers(
     # Initialize the GS size to be the average dist of the 3 nearest neighbors
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
     dist_avg = torch.sqrt(dist2_avg)
-    scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 6)  # [N, 3]
+    scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
 
     # Distribute the GSs to different ranks (also works for single rank)
     points = points[world_rank::world_size]
@@ -194,24 +194,22 @@ def create_splats_with_optimizers(
 
     # Define learning rates for gauss_params and decoders
     learning_rates = {
-        "anchors": 0.0001,
-        "scales": 0.007,
-        "quats": 0.002,
-        "features": 0.0075,
+        "anchors": 1e-4,
+        "features": 7.5e-3,
+        "scales": 7e-3,
         "opacities": 5e-2,
-        "offsets": 0.01 * scene_scale,
-        "opacities_mlp": 0.002,
-        "colors_mlp": 0.008,
-        "scale_rot_mlp": 0.0004,
+        "offsets": 1e-5 * scene_scale,
+        "opacities_mlp": 2e-3,
+        "colors_mlp": 8e-3,
+        "scale_rot_mlp": 4e-4,
     }
 
     # Define gauss_params
     gauss_params = torch.nn.ParameterDict(
         {
             "anchors": torch.nn.Parameter(points),
-            "scales": torch.nn.Parameter(scales),
-            "quats": torch.nn.Parameter(quats),
             "features": torch.nn.Parameter(features),
+            "scales": torch.nn.Parameter(scales),
             "opacities": torch.nn.Parameter(opacities),
             "offsets": torch.nn.Parameter(offsets),
         }
@@ -429,131 +427,74 @@ class Runner:
         Ks: Tensor,
         width: int,
         height: int,
-        packed: bool,
-        rasterize_mode: str,
     ):
+        k = self.cfg.n_feat_offsets
 
-        # Compare paper: Helps mainly to speed up the rasterization. Has no quality impact
-        visible_anchor_mask = view_to_visible_anchors(
-            means=self.splats["gauss_params"]["anchors"],
-            quats=self.splats["gauss_params"]["quats"],
-            scales=torch.exp(self.splats["gauss_params"]["scales"][:, :3]),
-            viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
-            Ks=Ks,  # [C, 3, 3]
-            width=width,
-            height=height,
-            packed=packed,
-            rasterize_mode=rasterize_mode,
-        )
-        # If no visibility mask is provided, we select all anchors including their offsets
-        selected_features = self.splats["gauss_params"]["features"][
-            visible_anchor_mask
-        ]  # [M, c]
-        selected_anchors = self.splats["gauss_params"]["anchors"][
-            visible_anchor_mask
-        ]  # [M, 3]
-        selected_offsets = self.splats["gauss_params"]["offsets"][
-            visible_anchor_mask
-        ]  # [M, k, 3]
-        selected_quats = self.splats["gauss_params"]["quats"][
-            visible_anchor_mask
-        ]  # [M, 4]
-        selected_scales = torch.exp(
-            self.splats["gauss_params"]["scales"][visible_anchor_mask]
-        )  # [M, 6]
+        # select visible anchors
+        viewmats = torch.linalg.inv(camtoworlds)
+        R = viewmats[:, :3, :3]  # [C, 3, 3]
+        t = viewmats[:, :3, 3]  # [C, 3]
+        means_c = torch.einsum("cij,nj->cni", R, self.splats["gauss_params"]["anchors"]) + t[:, None, :]  # (C, N, 3)
+        means2d = torch.einsum("cij,cnj->cni", Ks[:, :2, :3], means_c)  # [C, N, 2]
+        means2d = means2d / means_c[..., 2:]  # [C, N, 2]
+        valid = (means2d[..., 0] > 0) & (means2d[..., 0] < width) & (means2d[..., 1] > 0) & (means2d[..., 1] < height)
+        valid &= (means_c[..., 2] > 0.01) & (means_c[..., 2] < 1e10) # [C, N]
+        visible_anchor_mask = valid[0, :]
+        
+        vis_features = self.splats["gauss_params"]["features"][visible_anchor_mask]  # [M, c]
+        vis_anchors = self.splats["gauss_params"]["anchors"][visible_anchor_mask]  # [M, 3]
+        vis_offsets = self.splats["gauss_params"]["offsets"][visible_anchor_mask]  # [M, k, 3]
+        vis_scales = self.splats["gauss_params"]["scales"][visible_anchor_mask].exp()  # [M, 3]
 
         # See formula (5) in Scaffold-GS
-
         cam_pos = camtoworlds[:, :3, 3]
-        view_dir = selected_anchors - cam_pos  # [M, 3]
+        view_dir = vis_anchors - cam_pos  # [M, 3]
         length = view_dir.norm(dim=1, keepdim=True)
         view_dir_normalized = view_dir / length  # [M, 3]
 
         # See formula (9) and the appendix for the rest
-        feature_view_dir = torch.cat(
-            [selected_features, view_dir_normalized], dim=1
-        )  # [M, c+3]
-
-        k = self.cfg.n_feat_offsets  # Number of offsets per anchor
+        feature_view_dir = torch.cat([vis_features, view_dir_normalized], dim=1)  # [M, c+3]
 
         # Apply MLPs (they output per-offset features concatenated along the last dimension)
-        neural_opacity = self.splats["decoders"]["opacities_mlp"](
-            feature_view_dir
-        )  # [M, k*1]
+        neural_opacity = self.splats["decoders"]["opacities_mlp"](feature_view_dir)  # [M, k*1]
         neural_opacity = neural_opacity.view(-1, 1)  # [M*k, 1]
         neural_selection_mask = (neural_opacity > 0.0).view(-1)  # [M*k]
 
         # Get color and reshape
-        neural_colors = self.splats["decoders"]["colors_mlp"](
-            feature_view_dir
-        )  # [M, k*3]
+        neural_colors = self.splats["decoders"]["colors_mlp"](feature_view_dir)  # [M, k*3]
         neural_colors = neural_colors.view(-1, 3)  # [M*k, 3]
 
         # Get scale and rotation and reshape
-        neural_scale_rot = self.splats["decoders"]["scale_rot_mlp"](
-            feature_view_dir
-        )  # [M, k*7]
+        neural_scale_rot = self.splats["decoders"]["scale_rot_mlp"](feature_view_dir)  # [M, k*7]
         neural_scale_rot = neural_scale_rot.view(-1, 7)  # [M*k, 7]
 
-        # Reshape selected_offsets, scales, and anchors
-        selected_offsets = selected_offsets.view(-1, 3)  # [M*k, 3]
-        scales_repeated = (
-            selected_scales.unsqueeze(1).repeat(1, k, 1).view(-1, 6)
-        )  # [M*k, 6]
-        anchors_repeated = (
-            selected_anchors.unsqueeze(1).repeat(1, k, 1).view(-1, 3)
-        )  # [M*k, 3]
-        quats_repeated = (
-            selected_quats.unsqueeze(1).repeat(1, k, 1).view(-1, 4)
-        )  # [M*k, 3]
+        # Reshape vis_offsets, scales, and anchors
+        vis_offsets = vis_offsets.view(-1, 3)  # [M*k, 3]
+        scales_repeated = vis_scales.unsqueeze(1).repeat(1, k, 1).view(-1, 3)  # [M*k, 3]
+        anchors_repeated = vis_anchors.unsqueeze(1).repeat(1, k, 1).view(-1, 3)  # [M*k, 3]
 
         # Apply positive opacity mask
-        selected_opacity = neural_opacity[neural_selection_mask].squeeze(-1)  # [M]
-        selected_colors = neural_colors[neural_selection_mask]  # [M, 3]
-        selected_scale_rot = neural_scale_rot[neural_selection_mask]  # [M, 7]
-        selected_offsets = selected_offsets[neural_selection_mask]  # [M, 3]
-        scales_repeated = scales_repeated[neural_selection_mask]  # [M, 6]
+        vis_opacity = neural_opacity[neural_selection_mask].squeeze(-1)  # [M]
+        vis_colors = neural_colors[neural_selection_mask]  # [M, 3]
+        vis_scale_rot = neural_scale_rot[neural_selection_mask]  # [M, 7]
+        vis_offsets = vis_offsets[neural_selection_mask]  # [M, 3]
+        scales_repeated = scales_repeated[neural_selection_mask]  # [M, 3]
         anchors_repeated = anchors_repeated[neural_selection_mask]  # [M, 3]
-        quats_repeated = quats_repeated[neural_selection_mask]  # [M, 3]
 
         # Compute scales and rotations
-        scales = scales_repeated[:, 3:] * torch.sigmoid(
-            selected_scale_rot[:, :3]
-        )  # [M, 3]
-
-        def quaternion_multiply(q1, q2):
-            # Extract individual components of the quaternions
-            w1, x1, y1, z1 = q1[:, 0], q1[:, 1], q1[:, 2], q1[:, 3]
-            w2, x2, y2, z2 = q2[:, 0], q2[:, 1], q2[:, 2], q2[:, 3]
-
-            # Perform the quaternion multiplication
-            w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
-            x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
-            y = w1 * y2 + y1 * w2 + z1 * x2 - x1 * z2
-            z = w1 * z2 + z1 * w2 + x1 * y2 - y1 * x2
-
-            # Stack the result back into shape (N, 4)
-            return torch.stack((w, x, y, z), dim=-1)
-
-        # The rasterizer takes care of the normalization
-        rotation = quaternion_multiply(quats_repeated, selected_scale_rot[:, 3:7])
-
-        # Compute offsets and anchors
-        offsets = selected_offsets * scales_repeated[:, :3]  # [M, 3]
+        scales = scales_repeated * torch.sigmoid(vis_scale_rot[:, :3])  # [M, 3]
+        rotation = vis_scale_rot[:, 3:7]
+        offsets = vis_offsets * scales_repeated  # [M, 3]
         means = anchors_repeated + offsets  # [M, 3]
 
-        v_a = (
-            visible_anchor_mask.unsqueeze(dim=1)
-            .repeat([1, self.cfg.n_feat_offsets])
-            .view(-1)
-        )
+        v_a = visible_anchor_mask.unsqueeze(dim=1).repeat(1, k).view(-1)
         all_neural_gaussians = torch.zeros_like(v_a, dtype=torch.bool)
         all_neural_gaussians[v_a] = neural_selection_mask
 
         info = {
             "means": means,
-            "colors": selected_colors,
-            "opacities": selected_opacity,
+            "colors": vis_colors,
+            "opacities": vis_opacity,
             "scales": scales,
             "quats": rotation,
             "neural_opacities": neural_opacity,
@@ -577,8 +518,6 @@ class Runner:
             Ks=Ks,
             width=width,
             height=height,
-            packed=self.cfg.packed,
-            rasterize_mode="antialiased" if self.cfg.antialiased else "classic",
         )
 
         colors = info["colors"]  # [N, K, 3]

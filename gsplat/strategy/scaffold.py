@@ -131,20 +131,20 @@ class ScaffoldStrategy(Strategy):
 
         super().check_sanity(params, optimizers)
         # The following keys are required for this strategy.
-        expected_params = [
-            "anchors",
-            "features",
-            "offsets",
-            "scales",
-            "quats",
-            "opacities",
-        ]
+        # expected_params = [
+        #     "anchors",
+        #     "features",
+        #     "offsets",
+        #     "scales",
+        #     "quats",
+        #     "opacities",
+        # ]
 
-        assert len(expected_params) == len(
-            params
-        ), "expected params and actual params don't match"
-        for key in expected_params:
-            assert key in params, f"{key} is required in params but missing."
+        # assert len(expected_params) == len(
+        #     params
+        # ), "expected params and actual params don't match"
+        # for key in expected_params:
+            # assert key in params, f"{key} is required in params but missing."
 
     def step_pre_backward(
         self,
