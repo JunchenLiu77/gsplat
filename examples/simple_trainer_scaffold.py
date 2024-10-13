@@ -59,18 +59,22 @@ class PositionalEncodingMLP(torch.nn.Module):
 
         layers = []
         for i in range(num_layers):
-            layers.append(torch.nn.Linear(input_dim if i == 0 else output_dim, output_dim))
-            layers.append(torch.nn.BatchNorm1d(output_dim))
+            if i == 0:
+                layers.append(torch.nn.Linear(input_dim * num_frequencies * 2, latent_dim))
+            else:
+                layers.append(torch.nn.Linear(latent_dim, latent_dim))
+            layers.append(torch.nn.BatchNorm1d(latent_dim))
             layers.append(torch.nn.ReLU(True))
             if use_residual and i > 0:
-                layers.append(ResidualConnection(output_dim))
+                layers.append(ResidualConnection(latent_dim))
+        layers.append(torch.nn.Linear(latent_dim, output_dim))
         self.mlp = torch.nn.Sequential(*layers).cuda()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         frequencies = 2.0 ** torch.arange(self.num_frequencies, dtype=torch.float32, device=x.device)
-        x = x.unsqueeze(-1)  # [N, 3, 1]
-        encoded = (x * frequencies).view(x.shape[0], -1)  # [N, 3 * num_frequencies]
-        x = torch.cat([torch.sin(encoded), torch.cos(encoded)], dim=-1)  # [N, 6 * num_frequencies]
+        x = x.unsqueeze(-1)
+        encoded = (x * frequencies).view(x.shape[0], -1)
+        x = torch.cat([torch.sin(encoded), torch.cos(encoded)], dim=-1)
         return self.mlp(x)
 
 class ResidualConnection(torch.nn.Module):
@@ -210,8 +214,9 @@ def create_splats_with_optimizers(
 ]:
 
     # Compare GS-Scaffold paper formula (4)
-    points = np.unique(np.round(parser.points / voxel_size), axis=0) * voxel_size
-    points = torch.from_numpy(points).float()
+    # points = np.unique(np.round(parser.points / voxel_size), axis=0) * voxel_size
+    points = torch.from_numpy(parser.points).float()
+    colors = torch.from_numpy(parser.points_rgb / 255.0).float()
 
     # Initialize the GS size to be the average dist of the 3 nearest neighbors
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
@@ -219,79 +224,80 @@ def create_splats_with_optimizers(
     scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
 
     # Distribute the GSs to different ranks (also works for single rank)
-    points = points[world_rank::world_size]
-    scales = scales[world_rank::world_size]
+    points = points[world_rank::world_size].cuda()
+    scales = scales[world_rank::world_size].cuda()
     N = points.shape[0]
 
     features = torch.zeros((N, cfg.feat_dim))
     offsets = torch.zeros((N, cfg.n_feat_offsets, 3))
 
-    opacities = torch.logit(torch.full((N, 1), init_opacity))  # [N,]
+    opacities = torch.logit(torch.full((N, 1), init_opacity)).cuda()  # [N,]
 
     # Define learning rates for gauss_params and decoders
     learning_rates = {
         "anchors": 1e-4,
-        "features": 7.5e-3,
-        "scales": 7e-3,
-        "opacities": 5e-2,
-        "offsets": 1e-5 * scene_scale,
+        # "features": 7.5e-3,
+        # "scales": 7e-3,
+        # "opacities": 5e-2,
+        # "offsets": 1e-5 * scene_scale,
         "feature_mlp": 1e-3,
-        "opacities_mlp": 2e-3,
-        "colors_mlp": 1e-2,
-        "scale_rot_mlp": 4e-4,
+        # "opacities_mlp": 2e-3,
+        # "colors_mlp": 1e-2,
+        # "scale_rot_mlp": 4e-4,
     }
 
     # Define gauss_params
     gauss_params = torch.nn.ParameterDict(
         {
             "anchors": torch.nn.Parameter(points),
-            "features": torch.nn.Parameter(features),
-            "scales": torch.nn.Parameter(scales),
-            "opacities": torch.nn.Parameter(opacities),
-            "offsets": torch.nn.Parameter(offsets),
+            # "features": torch.nn.Parameter(features),
+            # "scales": torch.nn.Parameter(scales),
+            # "opacities": torch.nn.Parameter(opacities),
+            # "offsets": torch.nn.Parameter(offsets),
         }
     ).to(device)
     
     feature_mlp: torch.nn.Sequential = PositionalEncodingMLP(
         input_dim=3,
-        output_dim=cfg.feat_dim,
+        latent_dim=cfg.feat_dim,
+        output_dim=11, # color + opacity + quat + scale [3 + 1 + 4 + 3]
         num_layers=8,
         num_frequencies=10,
         use_residual=True
     ).cuda()
 
-    # Define the MLPs (decoders)
-    colors_mlp: torch.nn.Sequential = torch.nn.Sequential(
-        torch.nn.Linear(cfg.feat_dim, cfg.feat_dim),
-        torch.nn.ReLU(True),
-        torch.nn.Linear(cfg.feat_dim, cfg.feat_dim),
-        torch.nn.ReLU(True),
-        torch.nn.Linear(cfg.feat_dim, cfg.feat_dim),
-        torch.nn.ReLU(True),
-        torch.nn.Linear(cfg.feat_dim, 3 * cfg.n_feat_offsets),
-        torch.nn.Sigmoid(),
-    ).cuda()
+    # # Define the MLPs (decoders)
+    # colors_mlp: torch.nn.Sequential = torch.nn.Sequential(
+    #     torch.nn.Linear(cfg.feat_dim, cfg.feat_dim),
+    #     torch.nn.ReLU(True),
+    #     torch.nn.Linear(cfg.feat_dim, cfg.feat_dim),
+    #     torch.nn.ReLU(True),
+    #     torch.nn.Linear(cfg.feat_dim, cfg.feat_dim),
+    #     torch.nn.ReLU(True),
+    #     torch.nn.Linear(cfg.feat_dim, 3 * cfg.n_feat_offsets),
+    #     torch.nn.Sigmoid(),
+    # ).cuda()
 
-    opacities_mlp: torch.nn.Sequential = torch.nn.Sequential(
-        torch.nn.Linear(cfg.feat_dim, cfg.feat_dim),
-        torch.nn.ReLU(True),
-        torch.nn.Linear(cfg.feat_dim, cfg.n_feat_offsets),
-        torch.nn.Tanh(),
-    ).cuda()
+    # opacities_mlp: torch.nn.Sequential = torch.nn.Sequential(
+    #     torch.nn.Linear(cfg.feat_dim, cfg.feat_dim),
+    #     torch.nn.ReLU(True),
+    #     torch.nn.Linear(cfg.feat_dim, cfg.n_feat_offsets),
+    #     torch.nn.Tanh(),
+    # ).cuda()
 
-    scale_rot_mlp: torch.nn.Sequential = torch.nn.Sequential(
-        torch.nn.Linear(cfg.feat_dim, cfg.feat_dim),
-        torch.nn.ReLU(True),
-        torch.nn.Linear(cfg.feat_dim, 7 * cfg.n_feat_offsets),
-    ).cuda()
+    # scale_rot_mlp: torch.nn.Sequential = torch.nn.Sequential(
+    #     torch.nn.Linear(cfg.feat_dim, cfg.feat_dim),
+    #     torch.nn.ReLU(True),
+    #     torch.nn.Linear(cfg.feat_dim, 7 * cfg.n_feat_offsets),
+    # ).cuda()
 
     # Initialize decoders (MLPs)
     decoders = torch.nn.ModuleDict(
         {
             "feature_mlp": feature_mlp,
-            "opacities_mlp": opacities_mlp,
-            "colors_mlp": colors_mlp,
-            "scale_rot_mlp": scale_rot_mlp,
+            # "opacities_mlp": opacities_mlp,
+            # "colors_mlp": colors_mlp,
+            # "scale_rot_mlp": scale_rot_mlp,
         }
     ).to(device)
 
@@ -328,7 +334,30 @@ def create_splats_with_optimizers(
         "gauss_optimizer": gauss_optimizers,
         "decoders_optimizer": decoders_optimizers,
     }
-
+    
+    ############################################################################################
+    # TODO: fit the mlp to make opacities and scales small at first
+    for i in range(100):
+        x = torch.randn(N, 3).cuda()
+        y = feature_mlp(x)
+        colors_, opacities_, quats_, scales_ = y.split([3, 1, 4, 3], dim=-1)
+        loss = torch.nn.functional.mse_loss(opacities_, opacities) + \
+            torch.nn.functional.mse_loss(scales_, scales) + \
+            torch.nn.functional.mse_loss(colors_, colors)
+        print(f"[warmup] iter {i}: loss = {loss.item()}")
+        optimizers["decoders_optimizer"]["feature_mlp"].zero_grad()
+        loss.backward()
+        optimizers["decoders_optimizer"]["feature_mlp"].step()
+        
+    print(f"[warmup] done, avg opacities = {opacities.sigmoid().mean().item()}, avg scales = {scales.exp().mean().item()}")
+    optimizers["decoders_optimizer"]["feature_mlp"] = torch.optim.Adam(
+        optimizers["decoders_optimizer"]["feature_mlp"].param_groups,
+        lr=1e-4 * math.sqrt(BS),
+        eps=1e-15 / math.sqrt(BS),
+            betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+    )
+    ############################################################################################
+    
     # Return the gauss_params, decoders, and the dictionary of dictionaries for optimizers
     splats = {"gauss_params": gauss_params, "decoders": decoders}
     return splats, optimizers
@@ -478,78 +507,82 @@ class Runner:
         width: int,
         height: int,
     ):
-        k = self.cfg.n_feat_offsets
+        # k = self.cfg.n_feat_offsets
 
-        # select visible anchors
-        viewmats = torch.linalg.inv(camtoworlds)
-        R = viewmats[:, :3, :3]  # [C, 3, 3]
-        t = viewmats[:, :3, 3]  # [C, 3]
-        means_c = torch.einsum("cij,nj->cni", R, self.splats["gauss_params"]["anchors"]) + t[:, None, :]  # (C, N, 3)
-        means2d = torch.einsum("cij,cnj->cni", Ks[:, :2, :3], means_c)  # [C, N, 2]
-        means2d = means2d / means_c[..., 2:]  # [C, N, 2]
-        valid = (means2d[..., 0] > 0) & (means2d[..., 0] < width) & (means2d[..., 1] > 0) & (means2d[..., 1] < height)
-        valid &= (means_c[..., 2] > 0.01) & (means_c[..., 2] < 1e10) # [C, N]
-        visible_anchor_mask = valid[0, :]
+        # # select visible anchors
+        # viewmats = torch.linalg.inv(camtoworlds)
+        # R = viewmats[:, :3, :3]  # [C, 3, 3]
+        # t = viewmats[:, :3, 3]  # [C, 3]
+        # means_c = torch.einsum("cij,nj->cni", R, self.splats["gauss_params"]["anchors"]) + t[:, None, :]  # (C, N, 3)
+        # means2d = torch.einsum("cij,cnj->cni", Ks[:, :2, :3], means_c)  # [C, N, 2]
+        # means2d = means2d / means_c[..., 2:]  # [C, N, 2]
+        # valid = (means2d[..., 0] > 0) & (means2d[..., 0] < width) & (means2d[..., 1] > 0) & (means2d[..., 1] < height)
+        # valid &= (means_c[..., 2] > 0.01) & (means_c[..., 2] < 1e10) # [C, N]
+        # visible_anchor_mask = valid[0, :]
         
-        # vis_features = self.splats["gauss_params"]["features"][visible_anchor_mask]  # [M, c]
-        vis_anchors = self.splats["gauss_params"]["anchors"][visible_anchor_mask]  # [M, 3]
-        vis_offsets = self.splats["gauss_params"]["offsets"][visible_anchor_mask]  # [M, k, 3]
-        vis_scales = self.splats["gauss_params"]["scales"][visible_anchor_mask].exp()  # [M, 3]
+        # # vis_features = self.splats["gauss_params"]["features"][visible_anchor_mask]  # [M, c]
+        # vis_anchors = self.splats["gauss_params"]["anchors"][visible_anchor_mask]  # [M, 3]
+        # vis_offsets = self.splats["gauss_params"]["offsets"][visible_anchor_mask]  # [M, k, 3]
+        # vis_scales = self.splats["gauss_params"]["scales"][visible_anchor_mask].exp()  # [M, 3]
         
-        # predict features from position
-        vis_features = self.splats["decoders"]["feature_mlp"](vis_anchors)  # [M, c]
+        # # predict features from position
+        # vis_features = self.splats["decoders"]["feature_mlp"](vis_anchors)  # [M, c]
 
-        # remove view direction here
-        # cam_pos = camtoworlds[:, :3, 3]
-        # view_dir = vis_anchors - cam_pos  # [M, 3]
-        # length = view_dir.norm(dim=1, keepdim=True)
-        # view_dir_normalized = view_dir / length  # [M, 3]
+        # # remove view direction here
+        # # cam_pos = camtoworlds[:, :3, 3]
+        # # view_dir = vis_anchors - cam_pos  # [M, 3]
+        # # length = view_dir.norm(dim=1, keepdim=True)
+        # # view_dir_normalized = view_dir / length  # [M, 3]
 
-        # Apply MLPs (they output per-offset features concatenated along the last dimension)
-        neural_opacity = self.splats["decoders"]["opacities_mlp"](vis_features)  # [M, k*1]
-        neural_opacity = neural_opacity.view(-1, 1)  # [M*k, 1]
-        neural_selection_mask = (neural_opacity > 0.0).view(-1)  # [M*k]
+        # # Apply MLPs (they output per-offset features concatenated along the last dimension)
+        # neural_opacity = self.splats["decoders"]["opacities_mlp"](vis_features)  # [M, k*1]
+        # neural_opacity = neural_opacity.view(-1, 1)  # [M*k, 1]
+        # neural_selection_mask = (neural_opacity > 0.0).view(-1)  # [M*k]
 
-        # Get color and reshape
-        neural_colors = self.splats["decoders"]["colors_mlp"](vis_features)  # [M, k*3]
-        neural_colors = neural_colors.view(-1, 3)  # [M*k, 3]
+        # # Get color and reshape
+        # neural_colors = self.splats["decoders"]["colors_mlp"](vis_features)  # [M, k*3]
+        # neural_colors = neural_colors.view(-1, 3)  # [M*k, 3]
 
-        # Get scale and rotation and reshape
-        neural_scale_rot = self.splats["decoders"]["scale_rot_mlp"](vis_features)  # [M, k*7]
-        neural_scale_rot = neural_scale_rot.view(-1, 7)  # [M*k, 7]
+        # # Get scale and rotation and reshape
+        # neural_scale_rot = self.splats["decoders"]["scale_rot_mlp"](vis_features)  # [M, k*7]
+        # neural_scale_rot = neural_scale_rot.view(-1, 7)  # [M*k, 7]
 
-        # Reshape vis_offsets, scales, and anchors
-        vis_offsets = vis_offsets.view(-1, 3)  # [M*k, 3]
-        scales_repeated = vis_scales.unsqueeze(1).repeat(1, k, 1).view(-1, 3)  # [M*k, 3]
-        anchors_repeated = vis_anchors.unsqueeze(1).repeat(1, k, 1).view(-1, 3)  # [M*k, 3]
+        # # Reshape vis_offsets, scales, and anchors
+        # vis_offsets = vis_offsets.view(-1, 3)  # [M*k, 3]
+        # scales_repeated = vis_scales.unsqueeze(1).repeat(1, k, 1).view(-1, 3)  # [M*k, 3]
+        # anchors_repeated = vis_anchors.unsqueeze(1).repeat(1, k, 1).view(-1, 3)  # [M*k, 3]
 
-        # Apply positive opacity mask
-        vis_opacity = neural_opacity[neural_selection_mask].squeeze(-1)  # [M]
-        vis_colors = neural_colors[neural_selection_mask]  # [M, 3]
-        vis_scale_rot = neural_scale_rot[neural_selection_mask]  # [M, 7]
-        vis_offsets = vis_offsets[neural_selection_mask]  # [M, 3]
-        scales_repeated = scales_repeated[neural_selection_mask]  # [M, 3]
-        anchors_repeated = anchors_repeated[neural_selection_mask]  # [M, 3]
+        # # Apply positive opacity mask
+        # vis_opacity = neural_opacity[neural_selection_mask].squeeze(-1)  # [M]
+        # vis_colors = neural_colors[neural_selection_mask]  # [M, 3]
+        # vis_scale_rot = neural_scale_rot[neural_selection_mask]  # [M, 7]
+        # vis_offsets = vis_offsets[neural_selection_mask]  # [M, 3]
+        # scales_repeated = scales_repeated[neural_selection_mask]  # [M, 3]
+        # anchors_repeated = anchors_repeated[neural_selection_mask]  # [M, 3]
 
-        # Compute scales and rotations
-        scales = scales_repeated * torch.sigmoid(vis_scale_rot[:, :3])  # [M, 3]
-        rotation = vis_scale_rot[:, 3:7]
-        offsets = vis_offsets * scales_repeated  # [M, 3]
-        means = anchors_repeated + offsets  # [M, 3]
+        # # Compute scales and rotations
+        # scales = scales_repeated * torch.sigmoid(vis_scale_rot[:, :3])  # [M, 3]
+        # rotation = vis_scale_rot[:, 3:7]
+        # offsets = vis_offsets * scales_repeated  # [M, 3]
+        # means = anchors_repeated + offsets  # [M, 3]
 
-        v_a = visible_anchor_mask.unsqueeze(dim=1).repeat(1, k).view(-1)
-        all_neural_gaussians = torch.zeros_like(v_a, dtype=torch.bool)
-        all_neural_gaussians[v_a] = neural_selection_mask
+        # v_a = visible_anchor_mask.unsqueeze(dim=1).repeat(1, k).view(-1)
+        # all_neural_gaussians = torch.zeros_like(v_a, dtype=torch.bool)
+        # all_neural_gaussians[v_a] = neural_selection_mask
+        
+        means = self.splats["gauss_params"]["anchors"]
+        features = self.splats["decoders"]["feature_mlp"](means)
+        vis_colors, vis_opacity, rotation, scales = features.split([3, 1, 4, 3], dim=-1)
 
         info = {
             "means": means,
-            "colors": vis_colors,
-            "opacities": vis_opacity,
-            "scales": scales,
-            "quats": rotation,
-            "neural_opacities": neural_opacity,
-            "neural_selection_mask": all_neural_gaussians,
-            "visible_anchor_mask": visible_anchor_mask,
+            "colors": vis_colors.sigmoid(),
+            "opacities": vis_opacity.sigmoid()[:, 0],
+            "scales": scales.exp(),
+            "quats": rotation / rotation.norm(dim=-1, keepdim=True),
+            # "neural_opacities": neural_opacity,
+            # "neural_selection_mask": all_neural_gaussians,
+            # "visible_anchor_mask": visible_anchor_mask,
         }
         return info
 
@@ -613,20 +646,24 @@ class Runner:
                 gamma=0.001 ** (1.0 / max_steps),
             ),
             torch.optim.lr_scheduler.ExponentialLR(
-                self.optimizers["gauss_optimizer"]["offsets"],
-                gamma=(0.01 * self.scene_scale) ** (1.0 / max_steps),
-            ),
-            torch.optim.lr_scheduler.ExponentialLR(
-                self.optimizers["decoders_optimizer"]["opacities_mlp"],
+                self.optimizers["decoders_optimizer"]["feature_mlp"],
                 gamma=0.001 ** (1.0 / max_steps),
             ),
-            torch.optim.lr_scheduler.ExponentialLR(
-                self.optimizers["decoders_optimizer"]["colors_mlp"],
-                gamma=0.00625 ** (1.0 / max_steps),
-            ),
-            torch.optim.lr_scheduler.ExponentialLR(
-                self.optimizers["decoders_optimizer"]["scale_rot_mlp"], gamma=1.0
-            ),
+            # torch.optim.lr_scheduler.ExponentialLR(
+            #     self.optimizers["gauss_optimizer"]["offsets"],
+            #     gamma=(0.01 * self.scene_scale) ** (1.0 / max_steps),
+            # ),
+            # torch.optim.lr_scheduler.ExponentialLR(
+            #     self.optimizers["decoders_optimizer"]["opacities_mlp"],
+            #     gamma=0.001 ** (1.0 / max_steps),
+            # ),
+            # torch.optim.lr_scheduler.ExponentialLR(
+            #     self.optimizers["decoders_optimizer"]["colors_mlp"],
+            #     gamma=0.00625 ** (1.0 / max_steps),
+            # ),
+            # torch.optim.lr_scheduler.ExponentialLR(
+            #     self.optimizers["decoders_optimizer"]["scale_rot_mlp"], gamma=1.0
+            # ),
         ]
         if cfg.pose_opt:
             # pose optimization has a learning rate schedule
@@ -666,9 +703,10 @@ class Runner:
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
 
-        self.splats["decoders"]["scale_rot_mlp"].train()
-        self.splats["decoders"]["opacities_mlp"].train()
-        self.splats["decoders"]["colors_mlp"].train()
+        # self.splats["decoders"]["scale_rot_mlp"].train()
+        # self.splats["decoders"]["opacities_mlp"].train()
+        # self.splats["decoders"]["colors_mlp"].train()
+        self.splats["decoders"]["feature_mlp"].train()
 
         for step in pbar:
             if not cfg.disable_viewer:
