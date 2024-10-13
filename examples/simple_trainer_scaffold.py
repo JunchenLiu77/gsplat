@@ -43,6 +43,43 @@ from gsplat.distributed import cli
 from gsplat.rendering import rasterization, view_to_visible_anchors
 from gsplat.strategy import ScaffoldStrategy
 
+class PositionalEncodingMLP(torch.nn.Module):
+    def __init__(
+            self, 
+            input_dim: int, 
+            latent_dim: int,
+            output_dim: int, 
+            num_layers: int, 
+            num_frequencies: int, 
+            use_residual: bool
+        ):
+        super().__init__()
+        self.num_frequencies = num_frequencies
+        self.use_residual = use_residual
+
+        layers = []
+        for i in range(num_layers):
+            layers.append(torch.nn.Linear(input_dim if i == 0 else output_dim, output_dim))
+            layers.append(torch.nn.BatchNorm1d(output_dim))
+            layers.append(torch.nn.ReLU(True))
+            if use_residual and i > 0:
+                layers.append(ResidualConnection(output_dim))
+        self.mlp = torch.nn.Sequential(*layers).cuda()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        frequencies = 2.0 ** torch.arange(self.num_frequencies, dtype=torch.float32, device=x.device)
+        x = x.unsqueeze(-1)  # [N, 3, 1]
+        encoded = (x * frequencies).view(x.shape[0], -1)  # [N, 3 * num_frequencies]
+        x = torch.cat([torch.sin(encoded), torch.cos(encoded)], dim=-1)  # [N, 6 * num_frequencies]
+        return self.mlp(x)
+
+class ResidualConnection(torch.nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        return x + torch.nn.functional.relu(x)
 
 @dataclass
 class Config:
@@ -68,7 +105,7 @@ class Config:
     # Normalize the world space
     normalize_world_space: bool = True
     # Dimensionality of anchor features
-    feat_dim: int = 128
+    feat_dim: int = 256
     # Number offsets
     n_feat_offsets: int = 10
 
@@ -198,8 +235,9 @@ def create_splats_with_optimizers(
         "scales": 7e-3,
         "opacities": 5e-2,
         "offsets": 1e-5 * scene_scale,
+        "feature_mlp": 1e-3,
         "opacities_mlp": 2e-3,
-        "colors_mlp": 8e-3,
+        "colors_mlp": 1e-2,
         "scale_rot_mlp": 4e-4,
     }
 
@@ -213,9 +251,21 @@ def create_splats_with_optimizers(
             "offsets": torch.nn.Parameter(offsets),
         }
     ).to(device)
+    
+    feature_mlp: torch.nn.Sequential = PositionalEncodingMLP(
+        input_dim=3,
+        output_dim=cfg.feat_dim,
+        num_layers=8,
+        num_frequencies=10,
+        use_residual=True
+    ).cuda()
 
     # Define the MLPs (decoders)
     colors_mlp: torch.nn.Sequential = torch.nn.Sequential(
+        torch.nn.Linear(cfg.feat_dim, cfg.feat_dim),
+        torch.nn.ReLU(True),
+        torch.nn.Linear(cfg.feat_dim, cfg.feat_dim),
+        torch.nn.ReLU(True),
         torch.nn.Linear(cfg.feat_dim, cfg.feat_dim),
         torch.nn.ReLU(True),
         torch.nn.Linear(cfg.feat_dim, 3 * cfg.n_feat_offsets),
@@ -238,6 +288,7 @@ def create_splats_with_optimizers(
     # Initialize decoders (MLPs)
     decoders = torch.nn.ModuleDict(
         {
+            "feature_mlp": feature_mlp,
             "opacities_mlp": opacities_mlp,
             "colors_mlp": colors_mlp,
             "scale_rot_mlp": scale_rot_mlp,
@@ -440,10 +491,13 @@ class Runner:
         valid &= (means_c[..., 2] > 0.01) & (means_c[..., 2] < 1e10) # [C, N]
         visible_anchor_mask = valid[0, :]
         
-        vis_features = self.splats["gauss_params"]["features"][visible_anchor_mask]  # [M, c]
+        # vis_features = self.splats["gauss_params"]["features"][visible_anchor_mask]  # [M, c]
         vis_anchors = self.splats["gauss_params"]["anchors"][visible_anchor_mask]  # [M, 3]
         vis_offsets = self.splats["gauss_params"]["offsets"][visible_anchor_mask]  # [M, k, 3]
         vis_scales = self.splats["gauss_params"]["scales"][visible_anchor_mask].exp()  # [M, 3]
+        
+        # predict features from position
+        vis_features = self.splats["decoders"]["feature_mlp"](vis_anchors)  # [M, c]
 
         # remove view direction here
         # cam_pos = camtoworlds[:, :3, 3]
