@@ -118,7 +118,7 @@ class Config:
     # Dimensionality of anchor features
     feat_dim: int = 256
     # Number offsets
-    n_feat_offsets: int = 10
+    n_feat_offsets: int = 4
 
     # Port for the viewer server
     port: int = 8080
@@ -164,7 +164,11 @@ class Config:
     random_bkgd: bool = False
 
     # Scale regularization
-    scale_reg: float = 0.001
+    scale_reg: float = 0.1
+    # Opacity regularization
+    opacity_reg: float = 0.1
+    # Offset regularization
+    offset_reg: float = 0.1
 
     # Enable camera optimization.
     pose_opt: bool = False
@@ -236,17 +240,17 @@ def create_splats_with_optimizers(
     N = points.shape[0]
 
     features = torch.zeros((N, cfg.feat_dim))
-    offsets = torch.zeros((N, cfg.n_feat_offsets, 3))
+    offsets = torch.randn((N, cfg.n_feat_offsets, 3)) * scene_scale * 0.01
 
     opacities = torch.logit(torch.full((N, 1), init_opacity)).cuda()  # [N,]
 
     # Define learning rates for gauss_params and decoders
     learning_rates = {
-        "anchors": 1e-4,
+        "anchors": 0,  # 1e-4
         # "features": 7.5e-3,
         # "scales": 7e-3,
         # "opacities": 5e-2,
-        # "offsets": 1e-5 * scene_scale,
+        "offsets": 1e-3,
         "feature_mlp": 1e-3,
         # "opacities_mlp": 2e-3,
         # "colors_mlp": 1e-2,
@@ -260,7 +264,7 @@ def create_splats_with_optimizers(
             # "features": torch.nn.Parameter(features),
             # "scales": torch.nn.Parameter(scales),
             # "opacities": torch.nn.Parameter(opacities),
-            # "offsets": torch.nn.Parameter(offsets),
+            "offsets": torch.nn.Parameter(offsets),
         }
     ).to(device)
 
@@ -511,92 +515,6 @@ class Runner:
                 mode="training",
             )
 
-    def get_neural_gaussians(
-        self,
-        camtoworlds: Tensor,
-        Ks: Tensor,
-        width: int,
-        height: int,
-    ):
-        # k = self.cfg.n_feat_offsets
-
-        # # select visible anchors
-        # viewmats = torch.linalg.inv(camtoworlds)
-        # R = viewmats[:, :3, :3]  # [C, 3, 3]
-        # t = viewmats[:, :3, 3]  # [C, 3]
-        # means_c = torch.einsum("cij,nj->cni", R, self.splats["gauss_params"]["anchors"]) + t[:, None, :]  # (C, N, 3)
-        # means2d = torch.einsum("cij,cnj->cni", Ks[:, :2, :3], means_c)  # [C, N, 2]
-        # means2d = means2d / means_c[..., 2:]  # [C, N, 2]
-        # valid = (means2d[..., 0] > 0) & (means2d[..., 0] < width) & (means2d[..., 1] > 0) & (means2d[..., 1] < height)
-        # valid &= (means_c[..., 2] > 0.01) & (means_c[..., 2] < 1e10) # [C, N]
-        # visible_anchor_mask = valid[0, :]
-
-        # # vis_features = self.splats["gauss_params"]["features"][visible_anchor_mask]  # [M, c]
-        # vis_anchors = self.splats["gauss_params"]["anchors"][visible_anchor_mask]  # [M, 3]
-        # vis_offsets = self.splats["gauss_params"]["offsets"][visible_anchor_mask]  # [M, k, 3]
-        # vis_scales = self.splats["gauss_params"]["scales"][visible_anchor_mask].exp()  # [M, 3]
-
-        # # predict features from position
-        # vis_features = self.splats["decoders"]["feature_mlp"](vis_anchors)  # [M, c]
-
-        # # remove view direction here
-        # # cam_pos = camtoworlds[:, :3, 3]
-        # # view_dir = vis_anchors - cam_pos  # [M, 3]
-        # # length = view_dir.norm(dim=1, keepdim=True)
-        # # view_dir_normalized = view_dir / length  # [M, 3]
-
-        # # Apply MLPs (they output per-offset features concatenated along the last dimension)
-        # neural_opacity = self.splats["decoders"]["opacities_mlp"](vis_features)  # [M, k*1]
-        # neural_opacity = neural_opacity.view(-1, 1)  # [M*k, 1]
-        # neural_selection_mask = (neural_opacity > 0.0).view(-1)  # [M*k]
-
-        # # Get color and reshape
-        # neural_colors = self.splats["decoders"]["colors_mlp"](vis_features)  # [M, k*3]
-        # neural_colors = neural_colors.view(-1, 3)  # [M*k, 3]
-
-        # # Get scale and rotation and reshape
-        # neural_scale_rot = self.splats["decoders"]["scale_rot_mlp"](vis_features)  # [M, k*7]
-        # neural_scale_rot = neural_scale_rot.view(-1, 7)  # [M*k, 7]
-
-        # # Reshape vis_offsets, scales, and anchors
-        # vis_offsets = vis_offsets.view(-1, 3)  # [M*k, 3]
-        # scales_repeated = vis_scales.unsqueeze(1).repeat(1, k, 1).view(-1, 3)  # [M*k, 3]
-        # anchors_repeated = vis_anchors.unsqueeze(1).repeat(1, k, 1).view(-1, 3)  # [M*k, 3]
-
-        # # Apply positive opacity mask
-        # vis_opacity = neural_opacity[neural_selection_mask].squeeze(-1)  # [M]
-        # vis_colors = neural_colors[neural_selection_mask]  # [M, 3]
-        # vis_scale_rot = neural_scale_rot[neural_selection_mask]  # [M, 7]
-        # vis_offsets = vis_offsets[neural_selection_mask]  # [M, 3]
-        # scales_repeated = scales_repeated[neural_selection_mask]  # [M, 3]
-        # anchors_repeated = anchors_repeated[neural_selection_mask]  # [M, 3]
-
-        # # Compute scales and rotations
-        # scales = scales_repeated * torch.sigmoid(vis_scale_rot[:, :3])  # [M, 3]
-        # rotation = vis_scale_rot[:, 3:7]
-        # offsets = vis_offsets * scales_repeated  # [M, 3]
-        # means = anchors_repeated + offsets  # [M, 3]
-
-        # v_a = visible_anchor_mask.unsqueeze(dim=1).repeat(1, k).view(-1)
-        # all_neural_gaussians = torch.zeros_like(v_a, dtype=torch.bool)
-        # all_neural_gaussians[v_a] = neural_selection_mask
-
-        means = self.splats["gauss_params"]["anchors"]
-        features = self.splats["decoders"]["feature_mlp"](means)
-        vis_colors, vis_opacity, rotation, scales = features.split([3, 1, 4, 3], dim=-1)
-
-        info = {
-            "means": means,
-            "colors": vis_colors.sigmoid(),
-            "opacities": vis_opacity.sigmoid()[:, 0],
-            "scales": scales.exp(),
-            "quats": rotation / rotation.norm(dim=-1, keepdim=True),
-            # "neural_opacities": neural_opacity,
-            # "neural_selection_mask": all_neural_gaussians,
-            # "visible_anchor_mask": visible_anchor_mask,
-        }
-        return info
-
     def rasterize_splats(
         self,
         camtoworlds: Tensor,
@@ -607,14 +525,25 @@ class Runner:
     ) -> Tuple[Tensor, Tensor, Dict]:
 
         # Get all the gaussians per voxel spawned from the anchors
-        info = self.get_neural_gaussians(
-            camtoworlds=camtoworlds,
-            Ks=Ks,
-            width=width,
-            height=height,
-        )
+        means = (
+            self.splats["gauss_params"]["anchors"][:, None, :]
+            + self.splats["gauss_params"]["offsets"]
+        ).view(-1, 3)
+        # means = self.splats["gauss_params"]["anchors"]
+        features = self.splats["decoders"]["feature_mlp"](means)
+        vis_colors, vis_opacity, quats, scales = features.split([3, 1, 4, 3], dim=-1)
 
-        colors = info["colors"]  # [N, K, 3]
+        info = {
+            "means": means,
+            "colors": vis_colors.sigmoid(),
+            "opacities": vis_opacity.sigmoid()[:, 0],
+            "scales": scales.exp(),
+            "quats": quats / quats.norm(dim=-1, keepdim=True),
+            "offsets": self.splats["gauss_params"]["offsets"],
+            # "neural_opacities": neural_opacity,
+            # "neural_selection_mask": all_neural_gaussians,
+            # "visible_anchor_mask": visible_anchor_mask,
+        }
 
         rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
         render_colors, render_alphas, raster_info = rasterization(
@@ -622,7 +551,7 @@ class Runner:
             quats=info["quats"],
             scales=info["scales"],
             opacities=info["opacities"],
-            colors=colors,
+            colors=info["colors"],
             viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
             Ks=Ks,  # [C, 3, 3]
             width=width,
@@ -795,7 +724,19 @@ class Runner:
             )
             loss = l1loss * (1.0 - cfg.ssim_lambda)
             loss += ssimloss * cfg.ssim_lambda
-            loss += info["scales"].prod(dim=1).mean() * cfg.scale_reg
+            desc = f"loss={loss.item():.3f}| "
+            if cfg.scale_reg > 0:
+                scale_loss = info["scales"].prod(dim=1).mean() * cfg.scale_reg
+                loss += scale_loss
+                desc += f"scale loss={scale_loss.item():.6f}| "
+            if cfg.opacity_reg > 0:
+                opacity_loss = info["opacities"].mean() * cfg.opacity_reg
+                loss += opacity_loss
+                desc += f"opacity loss={opacity_loss.item():.6f}| "
+            if cfg.offset_reg > 0:
+                offset_loss = info["offsets"].norm(dim=-1).mean() * cfg.offset_reg
+                loss += offset_loss
+                desc += f"offset loss={offset_loss.item():.6f}| "
 
             if cfg.depth_loss:
                 # query depths from depth map
@@ -822,7 +763,6 @@ class Runner:
 
             loss.backward()
 
-            desc = f"loss={loss.item():.3f}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
