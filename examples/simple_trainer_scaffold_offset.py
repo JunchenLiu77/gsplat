@@ -116,7 +116,7 @@ class Config:
     # Normalize the world space
     normalize_world_space: bool = True
     # Dimensionality of anchor features
-    feat_dim: int = 128
+    feat_dim: int = 256
     # Number offsets
     n_feat_offsets: int = 4
 
@@ -225,35 +225,8 @@ def create_splats_with_optimizers(
 ]:
 
     # Compare GS-Scaffold paper formula (4)
-    corners = np.array(
-        [
-            [0, 0, 0],
-            [0, 0, 1],
-            [0, 1, 0],
-            [0, 1, 1],
-            [1, 0, 0],
-            [1, 0, 1],
-            [1, 1, 0],
-            [1, 1, 1],
-        ]
-    )
-    points = []
-    points.append(parser.points)
-    for scale_factor in [16, 64, 256, 1024]:
-        cur_size = voxel_size * scale_factor
-        for corner in corners:
-            points.append(
-                np.unique(np.round(parser.points / cur_size + corner), axis=0)
-                * cur_size
-            )
-    points = (
-        torch.from_numpy(np.unique(np.concatenate(points, axis=0), axis=0))
-        .float()
-        .cuda()
-    )
-    print(f"points.shape = {points.shape}")
-    # points = torch.from_numpy(parser.points).float()
-
+    # points = np.unique(np.round(parser.points / voxel_size), axis=0) * voxel_size
+    points = torch.from_numpy(parser.points).float()
     colors = torch.from_numpy(parser.points_rgb / 255.0).float().cuda()
 
     # Initialize the GS size to be the average dist of the 3 nearest neighbors
@@ -268,7 +241,6 @@ def create_splats_with_optimizers(
 
     features = torch.zeros((N, cfg.feat_dim))
     offsets = torch.randn((N, cfg.n_feat_offsets, 3)) * scene_scale * 0.01
-    # offsets = torch.zeros((N, cfg.n_feat_offsets, 3)).cuda()
 
     opacities = torch.logit(torch.full((N, 1), init_opacity)).cuda()  # [N,]
 
@@ -300,8 +272,8 @@ def create_splats_with_optimizers(
         input_dim=3,
         latent_dim=cfg.feat_dim,
         output_dim=11,  # color + opacity + quat + scale [3 + 1 + 4 + 3]
-        num_layers=5,
-        num_frequencies=4,
+        num_layers=8,
+        num_frequencies=10,
         use_residual=True,
     ).cuda()
 
@@ -377,11 +349,13 @@ def create_splats_with_optimizers(
     ############################################################################################
     # TODO: fit the mlp to make opacities and scales small at first
     for i in range(100):
-        y = feature_mlp(points)
+        x = torch.randn(N, 3).cuda()
+        y = feature_mlp(x)
         colors_, opacities_, quats_, scales_ = y.split([3, 1, 4, 3], dim=-1)
         loss = (
             torch.nn.functional.mse_loss(opacities_, opacities)
             + torch.nn.functional.mse_loss(scales_, scales)
+            + torch.nn.functional.mse_loss(colors_, colors)
         )
         print(f"[warmup] iter {i}: loss = {loss.item()}")
         optimizers["decoders_optimizer"]["feature_mlp"].zero_grad()
@@ -752,7 +726,7 @@ class Runner:
             loss += ssimloss * cfg.ssim_lambda
             desc = f"loss={loss.item():.3f}| "
             if cfg.scale_reg > 0:
-                scale_loss = info["scales"].mean() * cfg.scale_reg
+                scale_loss = info["scales"].prod(dim=1).mean() * cfg.scale_reg
                 loss += scale_loss
                 desc += f"scale loss={scale_loss.item():.6f}| "
             if cfg.opacity_reg > 0:
