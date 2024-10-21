@@ -135,8 +135,6 @@ class Config:
     # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
 
-    # voxel size for Scaffold-GS
-    voxel_size = 0.001
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
     init_extent: float = 3.0
     # Turn on another SH degree every this steps
@@ -196,6 +194,9 @@ class Config:
 
     lpips_net: Literal["vgg", "alex"] = "alex"
 
+    # voxel size for Scaffold-GS
+    vox_size: float = 0.008
+
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
@@ -204,7 +205,7 @@ class Config:
         strategy = self.strategy
         strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
         strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
-        strategy.voxel_size = self.voxel_size
+        strategy.vox_size = self.vox_size
 
 
 def create_splats_with_optimizers(
@@ -219,40 +220,20 @@ def create_splats_with_optimizers(
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
-    voxel_size: float = 0.001,
+    vox_size: float = 0.008,
 ) -> tuple[
     dict[str, ModuleDict | ParameterDict], dict[str, dict[str, SparseAdam | Adam]]
 ]:
+    points = torch.from_numpy(parser.points).float()
 
-    # Compare GS-Scaffold paper formula (4)
-    corners = np.array(
-        [
-            [0, 0, 0],
-            [0, 0, 1],
-            [0, 1, 0],
-            [0, 1, 1],
-            [1, 0, 0],
-            [1, 0, 1],
-            [1, 1, 0],
-            [1, 1, 1],
-        ]
+    # Initialize sparse voxel grid with sfm points
+    # position = (vox_indices + 1.5 * tanh(means)) * vox_size
+    vox_indices = torch.div(points, vox_size, rounding_mode="floor")
+    offsets = points / vox_size - vox_indices
+    means = torch.atanh(offsets * 2 / 3)
+    torch.testing.assert_close(
+        (vox_indices + 1.5 * torch.tanh(means)) * vox_size, points, rtol=1e-5, atol=1e-5
     )
-    points = []
-    points.append(parser.points)
-    for scale_factor in [16, 64, 256, 1024]:
-        cur_size = voxel_size * scale_factor
-        for corner in corners:
-            points.append(
-                np.unique(np.round(parser.points / cur_size + corner), axis=0)
-                * cur_size
-            )
-    points = (
-        torch.from_numpy(np.unique(np.concatenate(points, axis=0), axis=0))
-        .float()
-        .cuda()
-    )
-    print(f"points.shape = {points.shape}")
-    # points = torch.from_numpy(parser.points).float()
 
     colors = torch.from_numpy(parser.points_rgb / 255.0).float().cuda()
 
@@ -266,19 +247,19 @@ def create_splats_with_optimizers(
     scales = scales[world_rank::world_size].cuda()
     N = points.shape[0]
 
-    features = torch.zeros((N, cfg.feat_dim))
-    offsets = torch.randn((N, cfg.n_feat_offsets, 3)) * scene_scale * 0.01
+    # features = torch.zeros((N, cfg.feat_dim))
+    # offsets = torch.randn((N, cfg.n_feat_offsets, 3)) * scene_scale * 0.01
     # offsets = torch.zeros((N, cfg.n_feat_offsets, 3)).cuda()
 
     opacities = torch.logit(torch.full((N, 1), init_opacity)).cuda()  # [N,]
 
     # Define learning rates for gauss_params and decoders
     learning_rates = {
-        "anchors": 0,  # 1e-4
+        # "anchors": 0,  # 1e-4
         # "features": 7.5e-3,
         # "scales": 7e-3,
         # "opacities": 5e-2,
-        "offsets": 1e-3,
+        # "offsets": 1e-3,
         "feature_mlp": 1e-3,
         # "opacities_mlp": 2e-3,
         # "colors_mlp": 1e-2,
@@ -288,18 +269,18 @@ def create_splats_with_optimizers(
     # Define gauss_params
     gauss_params = torch.nn.ParameterDict(
         {
-            "anchors": torch.nn.Parameter(points),
+            # "anchors": torch.nn.Parameter(points),
             # "features": torch.nn.Parameter(features),
             # "scales": torch.nn.Parameter(scales),
             # "opacities": torch.nn.Parameter(opacities),
-            "offsets": torch.nn.Parameter(offsets),
+            # "offsets": torch.nn.Parameter(offsets),
         }
     ).to(device)
 
     feature_mlp: torch.nn.Sequential = PositionalEncodingMLP(
         input_dim=3,
         latent_dim=cfg.feat_dim,
-        output_dim=11,  # color + opacity + quat + scale [3 + 1 + 4 + 3]
+        output_dim=14,  # offset + color + opacity + quat + scale [3 + 3 + 1 + 4 + 3]
         num_layers=5,
         num_frequencies=4,
         use_residual=True,
@@ -377,11 +358,14 @@ def create_splats_with_optimizers(
     ############################################################################################
     # TODO: fit the mlp to make opacities and scales small at first
     for i in range(100):
-        y = feature_mlp(points)
-        colors_, opacities_, quats_, scales_ = y.split([3, 1, 4, 3], dim=-1)
+        features = feature_mlp(vox_indices.float().to(device))
+        offsets_, colors_, opacities_, quats_, scales_ = features.split(
+            [3, 3, 1, 4, 3], dim=-1
+        )
         loss = (
             torch.nn.functional.mse_loss(opacities_, opacities)
             + torch.nn.functional.mse_loss(scales_, scales)
+            + torch.nn.functional.mse_loss(offsets_, torch.zeros_like(offsets, device=device))
         )
         print(f"[warmup] iter {i}: loss = {loss.item()}")
         optimizers["decoders_optimizer"]["feature_mlp"].zero_grad()
@@ -401,7 +385,7 @@ def create_splats_with_optimizers(
 
     # Return the gauss_params, decoders, and the dictionary of dictionaries for optimizers
     splats = {"gauss_params": gauss_params, "decoders": decoders}
-    return splats, optimizers
+    return splats, optimizers, vox_indices.to(device)
 
 
 class Runner:
@@ -413,7 +397,7 @@ class Runner:
         set_random_seed(42 + local_rank)
 
         self.cfg = cfg
-        self.cfg.strategy.voxel_size = self.cfg.voxel_size
+        self.cfg.strategy.vox_size = self.cfg.vox_size
         self.world_rank = world_rank
         self.local_rank = local_rank
         self.world_size = world_size
@@ -449,9 +433,10 @@ class Runner:
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
+        self.vox_size = cfg.vox_size
 
         # Model
-        self.splats, self.optimizers = create_splats_with_optimizers(
+        self.splats, self.optimizers, self.vox_indices = create_splats_with_optimizers(
             self.parser,
             init_extent=cfg.init_extent,
             init_opacity=cfg.init_opa,
@@ -462,11 +447,7 @@ class Runner:
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
-            voxel_size=cfg.voxel_size,
-        )
-        print(
-            "Model initialized. Number of GS:",
-            len(self.splats["gauss_params"]["anchors"]),
+            vox_size=cfg.vox_size,
         )
 
         # Densification Strategy
@@ -551,21 +532,25 @@ class Runner:
     ) -> Tuple[Tensor, Tensor, Dict]:
 
         # Get all the gaussians per voxel spawned from the anchors
-        means = (
-            self.splats["gauss_params"]["anchors"][:, None, :]
-            + self.splats["gauss_params"]["offsets"]
-        ).view(-1, 3)
+        # means = (
+        #     self.splats["gauss_params"]["anchors"][:, None, :]
+        #     + self.splats["gauss_params"]["offsets"]
+        # ).view(-1, 3)
         # means = self.splats["gauss_params"]["anchors"]
-        features = self.splats["decoders"]["feature_mlp"](means)
-        vis_colors, vis_opacity, quats, scales = features.split([3, 1, 4, 3], dim=-1)
+        features = self.splats["decoders"]["feature_mlp"](
+            self.vox_indices.float() * self.vox_size
+        )
+        offsets, vis_colors, vis_opacity, quats, scales = features.split(
+            [3, 3, 1, 4, 3], dim=-1
+        )
 
         info = {
-            "means": means,
+            "means": (self.vox_indices + 1.5 * torch.tanh(offsets)) * self.vox_size,
             "colors": vis_colors.sigmoid(),
             "opacities": vis_opacity.sigmoid()[:, 0],
             "scales": scales.exp(),
             "quats": quats / quats.norm(dim=-1, keepdim=True),
-            "offsets": self.splats["gauss_params"]["offsets"],
+            "offsets": 1.5 * torch.tanh(offsets)
             # "neural_opacities": neural_opacity,
             # "neural_selection_mask": all_neural_gaussians,
             # "visible_anchor_mask": visible_anchor_mask,
@@ -607,10 +592,10 @@ class Runner:
         init_step = 0
 
         schedulers = [
-            torch.optim.lr_scheduler.ExponentialLR(
-                self.optimizers["gauss_optimizer"]["anchors"],
-                gamma=0.001 ** (1.0 / max_steps),
-            ),
+            # torch.optim.lr_scheduler.ExponentialLR(
+            #     self.optimizers["gauss_optimizer"]["anchors"],
+            #     gamma=0.001 ** (1.0 / max_steps),
+            # ),
             torch.optim.lr_scheduler.ExponentialLR(
                 self.optimizers["decoders_optimizer"]["feature_mlp"],
                 gamma=0.001 ** (1.0 / max_steps),
@@ -759,10 +744,10 @@ class Runner:
                 opacity_loss = info["opacities"].mean() * cfg.opacity_reg
                 loss += opacity_loss
                 desc += f"opacity loss={opacity_loss.item():.6f}| "
-            if cfg.offset_reg > 0:
-                offset_loss = info["offsets"].norm(dim=-1).mean() * cfg.offset_reg
-                loss += offset_loss
-                desc += f"offset loss={offset_loss.item():.6f}| "
+            # if cfg.offset_reg > 0:
+            #     offset_loss = info["offsets"].norm(dim=-1).mean() * cfg.offset_reg
+            #     loss += offset_loss
+            #     desc += f"offset loss={offset_loss.item():.6f}| "
 
             if cfg.depth_loss:
                 # query depths from depth map
@@ -802,9 +787,9 @@ class Runner:
                 self.writer.add_scalar("train/loss", loss.item(), step)
                 self.writer.add_scalar("train/l1loss", l1loss.item(), step)
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
-                self.writer.add_scalar(
-                    "train/num_GS", len(self.splats["gauss_params"]["anchors"]), step
-                )
+                # self.writer.add_scalar(
+                #     "train/num_GS", len(self.splats["gauss_params"]["anchors"]), step
+                # )
                 self.writer.add_scalar("train/mem", mem, step)
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
