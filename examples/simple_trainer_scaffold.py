@@ -116,7 +116,7 @@ class Config:
     # Normalize the world space
     normalize_world_space: bool = True
     # Dimensionality of anchor features
-    feat_dim: int = 128
+    feat_dim: int = 256
     # Number offsets
     n_feat_offsets: int = 4
 
@@ -195,7 +195,7 @@ class Config:
     lpips_net: Literal["vgg", "alex"] = "alex"
 
     # voxel size for Scaffold-GS
-    vox_size: float = 0.008
+    vox_size: float = 0.001
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -280,9 +280,10 @@ def create_splats_with_optimizers(
     feature_mlp: torch.nn.Sequential = PositionalEncodingMLP(
         input_dim=3,
         latent_dim=cfg.feat_dim,
-        output_dim=14,  # offset + color + opacity + quat + scale [3 + 3 + 1 + 4 + 3]
-        num_layers=5,
-        num_frequencies=4,
+        output_dim=14
+        * cfg.n_feat_offsets,  # offset[3] + color[3] + opacity[1] + quat[4] + scale[3]
+        num_layers=8,
+        num_frequencies=8,
         use_residual=True,
     ).cuda()
 
@@ -355,33 +356,37 @@ def create_splats_with_optimizers(
         "decoders_optimizer": decoders_optimizers,
     }
 
-    ############################################################################################
-    # TODO: fit the mlp to make opacities and scales small at first
-    for i in range(100):
-        features = feature_mlp(vox_indices.float().to(device))
-        offsets_, colors_, opacities_, quats_, scales_ = features.split(
-            [3, 3, 1, 4, 3], dim=-1
-        )
-        loss = (
-            torch.nn.functional.mse_loss(opacities_, opacities)
-            + torch.nn.functional.mse_loss(scales_, scales)
-            + torch.nn.functional.mse_loss(offsets_, torch.zeros_like(offsets, device=device))
-        )
-        print(f"[warmup] iter {i}: loss = {loss.item()}")
-        optimizers["decoders_optimizer"]["feature_mlp"].zero_grad()
-        loss.backward()
-        optimizers["decoders_optimizer"]["feature_mlp"].step()
+    # ############################################################################################
+    # # TODO: fit the mlp to make opacities and scales small at first
+    # for i in range(100):
+    #     features = feature_mlp(vox_indices.float().to(device) * vox_size)
+    #     offsets_, colors_, opacities_, quats_, scales_ = features.split(
+    #         [3, 3, 1, 4, 3], dim=-1
+    #     )
+    #     loss = (
+    #         torch.nn.functional.mse_loss(opacities_, opacities)
+    #         + torch.nn.functional.mse_loss(
+    #             scales_, torch.zeros_like(scales_, device=device)
+    #         )
+    #         + torch.nn.functional.mse_loss(
+    #             offsets_, torch.zeros_like(offsets, device=device)
+    #         )
+    #     )
+    #     print(f"[warmup] iter {i}: loss = {loss.item()}")
+    #     optimizers["decoders_optimizer"]["feature_mlp"].zero_grad()
+    #     loss.backward()
+    #     optimizers["decoders_optimizer"]["feature_mlp"].step()
 
-    print(
-        f"[warmup] done, avg opacities = {opacities.sigmoid().mean().item()}, avg scales = {scales.exp().mean().item()}"
-    )
-    optimizers["decoders_optimizer"]["feature_mlp"] = torch.optim.Adam(
-        optimizers["decoders_optimizer"]["feature_mlp"].param_groups,
-        lr=1e-4 * math.sqrt(BS),
-        eps=1e-15 / math.sqrt(BS),
-        betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
-    )
-    ############################################################################################
+    # # print(
+    # #     f"[warmup] done, avg opacities = {opacities.sigmoid().mean().item()}, avg scales = {scales.exp().mean().item()}"
+    # # )
+    # optimizers["decoders_optimizer"]["feature_mlp"] = torch.optim.Adam(
+    #     optimizers["decoders_optimizer"]["feature_mlp"].param_groups,
+    #     lr=1e-4 * math.sqrt(BS),
+    #     eps=1e-15 / math.sqrt(BS),
+    #     betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+    # )
+    # ############################################################################################
 
     # Return the gauss_params, decoders, and the dictionary of dictionaries for optimizers
     splats = {"gauss_params": gauss_params, "decoders": decoders}
@@ -540,17 +545,30 @@ class Runner:
         features = self.splats["decoders"]["feature_mlp"](
             self.vox_indices.float() * self.vox_size
         )
+        features = features.view(-1, self.cfg.n_feat_offsets, 14)
         offsets, vis_colors, vis_opacity, quats, scales = features.split(
             [3, 3, 1, 4, 3], dim=-1
         )
+        offsets = offsets.view(-1, 3)
+        vis_colors = vis_colors.view(-1, 3)
+        vis_opacity = vis_opacity.view(-1, 1)
+        quats = quats.view(-1, 4)
+        scales = scales.view(-1, 3)
 
         info = {
-            "means": (self.vox_indices + 1.5 * torch.tanh(offsets)) * self.vox_size,
+            "means": (
+                self.vox_indices[:, None, :]
+                .repeat(1, self.cfg.n_feat_offsets, 1)
+                .view(-1, 3)
+                + 10.0 * torch.tanh(offsets)
+            )
+            * self.vox_size,
             "colors": vis_colors.sigmoid(),
             "opacities": vis_opacity.sigmoid()[:, 0],
-            "scales": scales.exp(),
+            # "scales": scales.exp(),
+            "scales": torch.sigmoid(scales) * self.vox_size * 20,
             "quats": quats / quats.norm(dim=-1, keepdim=True),
-            "offsets": 1.5 * torch.tanh(offsets)
+            "offsets": 10.0 * torch.tanh(offsets),
             # "neural_opacities": neural_opacity,
             # "neural_selection_mask": all_neural_gaussians,
             # "visible_anchor_mask": visible_anchor_mask,
@@ -736,14 +754,14 @@ class Runner:
             loss = l1loss * (1.0 - cfg.ssim_lambda)
             loss += ssimloss * cfg.ssim_lambda
             desc = f"loss={loss.item():.3f}| "
-            if cfg.scale_reg > 0:
-                scale_loss = info["scales"].mean() * cfg.scale_reg
-                loss += scale_loss
-                desc += f"scale loss={scale_loss.item():.6f}| "
-            if cfg.opacity_reg > 0:
-                opacity_loss = info["opacities"].mean() * cfg.opacity_reg
-                loss += opacity_loss
-                desc += f"opacity loss={opacity_loss.item():.6f}| "
+            # if cfg.scale_reg > 0:
+            #     scale_loss = info["scales"].mean() * cfg.scale_reg
+            #     loss += scale_loss
+            #     desc += f"scale loss={scale_loss.item():.6f}| "
+            # if cfg.opacity_reg > 0:
+            #     opacity_loss = info["opacities"].mean() * cfg.opacity_reg
+            #     loss += opacity_loss
+            #     desc += f"opacity loss={opacity_loss.item():.6f}| "
             # if cfg.offset_reg > 0:
             #     offset_loss = info["offsets"].norm(dim=-1).mean() * cfg.offset_reg
             #     loss += offset_loss
@@ -807,7 +825,7 @@ class Runner:
                 stats = {
                     "mem": mem,
                     "ellipse_time": time.time() - global_tic,
-                    "num_GS": len(self.splats["gauss_params"]["anchors"]),
+                    # "num_GS": len(self.splats["gauss_params"]["anchors"]),
                 }
                 print("Step: ", step, stats)
                 with open(
@@ -815,27 +833,20 @@ class Runner:
                     "w",
                 ) as f:
                     json.dump(stats, f)
-                data = {
-                    "step": step,
-                    "feat_dim": self.cfg.feat_dim,
-                    "n_feat_offsets": self.cfg.n_feat_offsets,
-                    "gauss_params": self.splats["gauss_params"].state_dict(),
-                    "opacities_mlp": self.splats["decoders"][
-                        "opacities_mlp"
-                    ].state_dict(),
-                    "colors_mlp": self.splats["decoders"]["colors_mlp"].state_dict(),
-                    "scale_rot_mlp": self.splats["decoders"][
-                        "scale_rot_mlp"
-                    ].state_dict(),
-                }
-                if cfg.pose_opt:
-                    if world_size > 1:
-                        data["pose_adjust"] = self.pose_adjust.module.state_dict()
-                    else:
-                        data["pose_adjust"] = self.pose_adjust.state_dict()
-                torch.save(
-                    data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
-                )
+                # data = {
+                #     "step": step,
+                #     "feat_dim": self.cfg.feat_dim,
+                #     "n_feat_offsets": self.cfg.n_feat_offsets,
+                #     "gauss_params": self.splats["gauss_params"].state_dict(),
+                # }
+                # if cfg.pose_opt:
+                #     if world_size > 1:
+                #         data["pose_adjust"] = self.pose_adjust.module.state_dict()
+                #     else:
+                #         data["pose_adjust"] = self.pose_adjust.state_dict()
+                # torch.save(
+                #     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
+                # )
 
             # For now no post steps
             self.cfg.strategy.step_post_backward(
@@ -969,13 +980,13 @@ class Runner:
             stats.update(
                 {
                     "ellipse_time": ellipse_time,
-                    "num_GS": len(self.splats["gauss_params"]["anchors"]),
+                    # "num_GS": len(self.splats["gauss_params"]["anchors"]),
                 }
             )
             print(
                 f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
                 f"Time: {stats['ellipse_time']:.3f}s/image "
-                f"Number of GS: {stats['num_GS']}"
+                # f"Number of GS: {stats['num_GS']}"
             )
             # save stats as json
             with open(f"{self.stats_dir}/{stage}_step{step:04d}.json", "w") as f:
