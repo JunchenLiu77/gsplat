@@ -532,7 +532,7 @@ class Runner:
             .repeat(1, self.cfg.n_feat_offsets, 1)
             .view(-1, 1),
             "quats": quats / quats.norm(dim=-1, keepdim=True),
-            "offsets": 1.0 * torch.tanh(offsets),
+            "offsets": 1.0 * offsets,
             # "neural_opacities": neural_opacity,
             # "neural_selection_mask": all_neural_gaussians,
             # "visible_anchor_mask": visible_anchor_mask,
