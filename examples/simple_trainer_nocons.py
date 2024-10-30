@@ -123,7 +123,11 @@ class Config:
     # Dimensionality of anchor features
     feat_dim: int = 256
     # Number offsets
-    n_feat_offsets: int = 4
+    n_feat_offsets: int = 1
+    # Input token dimension
+    input_dim: int = 64
+    # Number of gaussians
+    n_gauss: int = 400_000
 
     # Port for the viewer server
     port: int = 8080
@@ -167,9 +171,9 @@ class Config:
     random_bkgd: bool = False
 
     # Scale regularization
-    scale_reg: float = 0.1
+    scale_reg: float = 0.01
     # Opacity regularization
-    opacity_reg: float = 0.1
+    opacity_reg: float = 0.01
     # Offset regularization
     offset_reg: float = 0.1
 
@@ -221,7 +225,6 @@ def create_splats_with_optimizers(
     scene_scale: float = 1.0,
     sparse_grad: bool = False,
     batch_size: int = 1,
-    feature_dim: Optional[int] = None,
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
@@ -253,12 +256,12 @@ def create_splats_with_optimizers(
 
     # Define learning rates for gauss_params and decoders
     learning_rates = {
-        "anchors": 0,  # 1e-4
+        "anchors": 1e-4,  # 1e-4
         # "features": 7.5e-3,
         # "scales": 7e-3,
         # "opacities": 5e-2,
         # "offsets": 1e-3,
-        "feature_mlp": 1e-3,
+        "feature_mlp": 1e-4,
         # "opacities_mlp": 2e-3,
         # "colors_mlp": 1e-2,
         # "scale_rot_mlp": 4e-4,
@@ -267,7 +270,9 @@ def create_splats_with_optimizers(
     # Define gauss_params
     gauss_params = torch.nn.ParameterDict(
         {
-            "anchors": torch.nn.Parameter(points),
+            "anchors": torch.nn.Parameter(
+                torch.randn((cfg.n_gauss, cfg.input_dim), device=device)
+            ),
             # "features": torch.nn.Parameter(features),
             # "scales": torch.nn.Parameter(scales),
             # "opacities": torch.nn.Parameter(opacities),
@@ -276,7 +281,7 @@ def create_splats_with_optimizers(
     ).to(device)
 
     feature_mlp: torch.nn.Sequential = PositionalEncodingMLP(
-        input_dim=3,
+        input_dim=cfg.input_dim,
         latent_dim=cfg.feat_dim,
         output_dim=14
         * cfg.n_feat_offsets,  # offset[3] + color[3] + opacity[1] + quat[4] + scale[3]
@@ -515,24 +520,25 @@ class Runner:
         scales = scales.view(-1, 3)
 
         info = {
-            "means": self.splats["gauss_params"]["anchors"][:, None, :]
-            .repeat(1, self.cfg.n_feat_offsets, 1)
-            .view(-1, 3)
-            + 1.0 * offsets
+            "means": offsets * 1e0,
+            # "means": self.splats["gauss_params"]["anchors"][:, None, :]
+            # .repeat(1, self.cfg.n_feat_offsets, 1)
+            # .view(-1, 3)
+            # + 1.0 * offsets,
             # * torch.tanh(offsets)
-            * self.sizes[:, None, None]
-            .repeat(1, self.cfg.n_feat_offsets, 1)
-            .view(-1, 1),
+            # * self.sizes[:, None, None]
+            # .repeat(1, self.cfg.n_feat_offsets, 1)
+            # .view(-1, 1),
             "colors": vis_colors.sigmoid(),
             "opacities": vis_opacity.sigmoid()[:, 0],
             # "scales": scales.exp(),
             # "scales": torch.sigmoid(scales)
-            "scales": F.softplus(scales)
-            * self.sizes[:, None, None]
-            .repeat(1, self.cfg.n_feat_offsets, 1)
-            .view(-1, 1),
+            "scales": F.softplus(scales) * 1e-2,
+            # * self.sizes[:, None, None]
+            # .repeat(1, self.cfg.n_feat_offsets, 1)
+            # .view(-1, 1),
             "quats": quats / quats.norm(dim=-1, keepdim=True),
-            "offsets": 1.0 * offsets,
+            # "offsets": 1.0 * offsets,
             # "neural_opacities": neural_opacity,
             # "neural_selection_mask": all_neural_gaussians,
             # "visible_anchor_mask": visible_anchor_mask,
@@ -574,29 +580,14 @@ class Runner:
         init_step = 0
 
         schedulers = [
-            # torch.optim.lr_scheduler.ExponentialLR(
-            #     self.optimizers["gauss_optimizer"]["anchors"],
-            #     gamma=0.001 ** (1.0 / max_steps),
-            # ),
+            torch.optim.lr_scheduler.ExponentialLR(
+                self.optimizers["gauss_optimizer"]["anchors"],
+                gamma=0.01 ** (1.0 / max_steps),
+            ),
             torch.optim.lr_scheduler.ExponentialLR(
                 self.optimizers["decoders_optimizer"]["feature_mlp"],
-                gamma=0.001 ** (1.0 / max_steps),
+                gamma=0.01 ** (1.0 / max_steps),
             ),
-            # torch.optim.lr_scheduler.ExponentialLR(
-            #     self.optimizers["gauss_optimizer"]["offsets"],
-            #     gamma=(0.01 * self.scene_scale) ** (1.0 / max_steps),
-            # ),
-            # torch.optim.lr_scheduler.ExponentialLR(
-            #     self.optimizers["decoders_optimizer"]["opacities_mlp"],
-            #     gamma=0.001 ** (1.0 / max_steps),
-            # ),
-            # torch.optim.lr_scheduler.ExponentialLR(
-            #     self.optimizers["decoders_optimizer"]["colors_mlp"],
-            #     gamma=0.00625 ** (1.0 / max_steps),
-            # ),
-            # torch.optim.lr_scheduler.ExponentialLR(
-            #     self.optimizers["decoders_optimizer"]["scale_rot_mlp"], gamma=1.0
-            # ),
         ]
         if cfg.pose_opt:
             # pose optimization has a learning rate schedule
@@ -718,12 +709,13 @@ class Runner:
             loss = l1loss * (1.0 - cfg.ssim_lambda)
             loss += ssimloss * cfg.ssim_lambda
             desc = f"loss={loss.item():.3f}| "
-            # if cfg.scale_reg > 0:
-            #     scale_loss = info["scales"].mean() * cfg.scale_reg
-            #     loss += scale_loss
-            #     desc += f"scale loss={scale_loss.item():.6f}| "
+            if cfg.scale_reg > 0:
+                scale_loss = info["scales"].mean() * cfg.scale_reg
+                loss += scale_loss
+                desc += f"scale loss={scale_loss.item():.6f}| "
             # if cfg.opacity_reg > 0:
-            #     opacity_loss = info["opacities"].mean() * cfg.opacity_reg
+            #     opacity_loss = (1 - info["opacities"]).mean() * cfg.opacity_reg
+            #     # opacity_loss = info["opacities"].mean() * cfg.opacity_reg
             #     loss += opacity_loss
             #     desc += f"opacity loss={opacity_loss.item():.6f}| "
             # if cfg.offset_reg > 0:
