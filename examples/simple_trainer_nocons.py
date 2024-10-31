@@ -123,11 +123,11 @@ class Config:
     # Dimensionality of anchor features
     feat_dim: int = 256
     # Number offsets
-    n_feat_offsets: int = 1
+    n_feat_offsets: int = 6
     # Input token dimension
     input_dim: int = 64
     # Number of gaussians
-    n_gauss: int = 400_000
+    n_gauss: int = 100_000
 
     # Port for the viewer server
     port: int = 8080
@@ -195,6 +195,8 @@ class Config:
     depth_loss: bool = False
     # Weight for depth loss
     depth_lambda: float = 1e-2
+    # Enable asymetric chamfer loss
+    asym_chamfer_loss: bool = True
 
     # Dump information to tensorboard every this steps
     tb_every: int = 100
@@ -709,10 +711,10 @@ class Runner:
             loss = l1loss * (1.0 - cfg.ssim_lambda)
             loss += ssimloss * cfg.ssim_lambda
             desc = f"loss={loss.item():.3f}| "
-            if cfg.scale_reg > 0:
-                scale_loss = info["scales"].mean() * cfg.scale_reg
-                loss += scale_loss
-                desc += f"scale loss={scale_loss.item():.6f}| "
+            # if cfg.scale_reg > 0:
+            #     scale_loss = info["scales"].mean() * cfg.scale_reg
+            #     loss += scale_loss
+            #     desc += f"scale loss={scale_loss.item():.6f}| "
             # if cfg.opacity_reg > 0:
             #     opacity_loss = (1 - info["opacities"]).mean() * cfg.opacity_reg
             #     # opacity_loss = info["opacities"].mean() * cfg.opacity_reg
@@ -745,6 +747,32 @@ class Runner:
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
+            if cfg.asym_chamfer_loss:
+
+                def asym_chamfer(points, gt_points):
+                    # only enforce gt_points to have close points in points
+                    from pykeops.torch import generic_argkmin
+
+                    knn = generic_argkmin(
+                        "SqDist(x, y)",
+                        "a = Vi(1)",
+                        "x = Vi(3)",
+                        "y = Vj(3)",
+                    )
+                    nn_indices = knn(gt_points, points)  # [N, 4]
+                    return (
+                        (gt_points[:, None, :] - points[nn_indices]).norm(dim=-1).mean()
+                    )
+
+                asym_chamfer_loss = asym_chamfer(
+                    info["means"],
+                    torch.from_numpy(self.parser.points).float().to(device),
+                ) + asym_chamfer(
+                    torch.from_numpy(self.parser.points).float().to(device),
+                    info["means"],
+                )
+                loss += asym_chamfer_loss
+                desc += f"asym chamfer loss={asym_chamfer_loss.item():.6f}| "
 
             loss.backward()
 
