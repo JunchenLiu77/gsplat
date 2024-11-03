@@ -819,18 +819,14 @@ class Runner:
                         (gt_points[:, None, :] - points[nn_indices]).norm(dim=-1).mean()
                     )
 
-                asym_chamfer_loss = (
-                    asym_chamfer(
-                        info["means"],
-                        torch.from_numpy(self.parser.points).float().to(device),
-                        # )
-                    )
-                    + asym_chamfer(
-                        # asym_chamfer_loss = asym_chamfer(
-                        torch.from_numpy(self.parser.points).float().to(device),
-                        info["means"],
-                    )
-                    * 10
+                asym_chamfer_loss = asym_chamfer(
+                    info["means"],
+                    torch.from_numpy(self.parser.points).float().to(device),
+                    # )
+                ) + asym_chamfer(
+                    # asym_chamfer_loss = asym_chamfer(
+                    torch.from_numpy(self.parser.points).float().to(device),
+                    info["means"],
                 )
                 loss += asym_chamfer_loss
                 desc += f"asym chamfer loss={asym_chamfer_loss.item():.6f}| "
