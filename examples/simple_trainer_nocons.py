@@ -73,7 +73,7 @@ class PositionalEncodingMLP(torch.nn.Module):
 
         last_layer = torch.nn.Linear(latent_dim, output_dim)
         torch.nn.init.normal_(last_layer.weight, mean=0.0, std=0.01)
-        torch.nn.init.zeros_(last_layer.bias)
+        torch.nn.init.constant_(last_layer.bias, 0.0)
         layers.append(last_layer)
 
         self.mlp = torch.nn.Sequential(*layers).cuda()
@@ -85,6 +85,40 @@ class PositionalEncodingMLP(torch.nn.Module):
         x = x.unsqueeze(-1)
         encoded = (x * frequencies).view(x.shape[0], -1)
         x = torch.cat([torch.sin(encoded), torch.cos(encoded)], dim=-1)
+        return self.mlp(x)
+
+
+class MLP(torch.nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        latent_dim: int,
+        output_dim: int,
+        num_layers: int,
+        use_residual: bool,
+    ):
+        super().__init__()
+        self.num_layers = num_layers
+        self.use_residual = use_residual
+
+        layers = []
+        for i in range(num_layers):
+            if i == 0:
+                layers.append(torch.nn.Linear(input_dim, latent_dim))
+            else:
+                layers.append(torch.nn.Linear(latent_dim, latent_dim))
+            layers.append(torch.nn.BatchNorm1d(latent_dim))
+            layers.append(torch.nn.ReLU(True))
+            if use_residual and i > 0:
+                layers.append(ResidualConnection(latent_dim))
+
+        last_layer = torch.nn.Linear(latent_dim, output_dim)
+        torch.nn.init.normal_(last_layer.weight, mean=0.0, std=0.01)
+        torch.nn.init.constant_(last_layer.bias, 0.0)
+        layers.append(last_layer)
+        self.mlp = torch.nn.Sequential(*layers).cuda()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.mlp(x)
 
 
@@ -122,12 +156,16 @@ class Config:
     normalize_world_space: bool = True
     # Dimensionality of anchor features
     feat_dim: int = 256
-    # Number offsets
-    n_feat_offsets: int = 6
     # Input token dimension
     input_dim: int = 64
+    # Number of layers
+    num_layers: int = 6
+    # # Number of frequencies
+    # num_frequencies: int = 6
+    # Number offsets
+    n_feat_offsets: int = 4
     # Number of gaussians
-    n_gauss: int = 100_000
+    n_gauss: int = 40_000
 
     # Port for the viewer server
     port: int = 8080
@@ -203,7 +241,7 @@ class Config:
     # Save training images to tensorboard
     tb_save_image: bool = False
 
-    lpips_net: Literal["vgg", "alex"] = "alex"
+    lpips_net: Literal["vgg", "alex"] = "vgg"
 
     # voxel size for Scaffold-GS
     vox_size: float = 0.001
@@ -258,12 +296,12 @@ def create_splats_with_optimizers(
 
     # Define learning rates for gauss_params and decoders
     learning_rates = {
-        "anchors": 1e-4,  # 1e-4
+        "anchors": 5e-4,
         # "features": 7.5e-3,
         # "scales": 7e-3,
         # "opacities": 5e-2,
         # "offsets": 1e-3,
-        "feature_mlp": 1e-4,
+        "feature_mlp": 5e-4,
         # "opacities_mlp": 2e-3,
         # "colors_mlp": 1e-2,
         # "scale_rot_mlp": 4e-4,
@@ -282,13 +320,12 @@ def create_splats_with_optimizers(
         }
     ).to(device)
 
-    feature_mlp: torch.nn.Sequential = PositionalEncodingMLP(
+    feature_mlp: torch.nn.Sequential = MLP(
         input_dim=cfg.input_dim,
         latent_dim=cfg.feat_dim,
         output_dim=14
         * cfg.n_feat_offsets,  # offset[3] + color[3] + opacity[1] + quat[4] + scale[3]
-        num_layers=8,
-        num_frequencies=8,
+        num_layers=cfg.num_layers,
         use_residual=True,
     ).cuda()
 
@@ -522,7 +559,7 @@ class Runner:
         scales = scales.view(-1, 3)
 
         info = {
-            "means": offsets * 1e0,
+            "means": offsets * self.scene_scale * 8,
             # "means": self.splats["gauss_params"]["anchors"][:, None, :]
             # .repeat(1, self.cfg.n_feat_offsets, 1)
             # .view(-1, 3)
@@ -535,7 +572,7 @@ class Runner:
             "opacities": vis_opacity.sigmoid()[:, 0],
             # "scales": scales.exp(),
             # "scales": torch.sigmoid(scales)
-            "scales": F.softplus(scales) * 1e-2,
+            "scales": F.softplus(scales) * self.scene_scale * 8e-2,
             # * self.sizes[:, None, None]
             # .repeat(1, self.cfg.n_feat_offsets, 1)
             # .view(-1, 1),
@@ -667,50 +704,68 @@ class Runner:
                 camtoworlds = self.pose_adjust(camtoworlds, image_ids)
 
             # forward
-            renders, alphas, info = self.rasterize_splats(
-                camtoworlds=camtoworlds,
-                Ks=Ks,
-                width=width,
-                height=height,
-                sh_degree=None,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                render_mode="RGB+ED" if cfg.depth_loss else "RGB",
+            # renders, alphas, info = self.rasterize_splats(
+            #     camtoworlds=camtoworlds,
+            #     Ks=Ks,
+            #     width=width,
+            #     height=height,
+            #     sh_degree=None,
+            #     near_plane=cfg.near_plane,
+            #     far_plane=cfg.far_plane,
+            #     render_mode="RGB+ED" if cfg.depth_loss else "RGB",
+            # )
+            info = {}
+            features = self.splats["decoders"]["feature_mlp"](
+                self.splats["gauss_params"]["anchors"]
             )
-            if renders.shape[-1] == 4:
-                colors, depths = renders[..., 0:3], renders[..., 3:4]
-            else:
-                colors, depths = renders, None
-
-            if cfg.use_bilateral_grid:
-                grid_y, grid_x = torch.meshgrid(
-                    (torch.arange(height, device=self.device) + 0.5) / height,
-                    (torch.arange(width, device=self.device) + 0.5) / width,
-                    indexing="ij",
-                )
-                grid_xy = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
-                colors = slice(self.bil_grids, grid_xy, colors, image_ids)["rgb"]
-
-            if cfg.random_bkgd:
-                bkgd = torch.rand(1, 3, device=device)
-                colors = colors + bkgd * (1.0 - alphas)
-
-            self.cfg.strategy.step_pre_backward(
-                params=self.splats["gauss_params"],
-                optimizers=self.optimizers["gauss_optimizer"],
-                state=self.strategy_state,
-                step=step,
-                info=info,
+            features = features.view(-1, self.cfg.n_feat_offsets, 14)
+            offsets, vis_colors, vis_opacity, quats, scales = features.split(
+                [3, 3, 1, 4, 3], dim=-1
             )
+            offsets = offsets.view(-1, 3)
+            info["means"] = offsets * self.scene_scale
+            # if renders.shape[-1] == 4:
+            #     colors, depths = renders[..., 0:3], renders[..., 3:4]
+            # else:
+            #     colors, depths = renders, None
 
-            # loss
-            l1loss = F.l1_loss(colors, pixels)
-            ssimloss = 1.0 - fused_ssim(
-                colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
-            )
+            # if cfg.use_bilateral_grid:
+            #     grid_y, grid_x = torch.meshgrid(
+            #         (torch.arange(height, device=self.device) + 0.5) / height,
+            #         (torch.arange(width, device=self.device) + 0.5) / width,
+            #         indexing="ij",
+            #     )
+            #     grid_xy = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
+            #     colors = slice(self.bil_grids, grid_xy, colors, image_ids)["rgb"]
+
+            # if cfg.random_bkgd:
+            #     bkgd = torch.rand(1, 3, device=device)
+            #     colors = colors + bkgd * (1.0 - alphas)
+
+            # self.cfg.strategy.step_pre_backward(
+            #     params=self.splats["gauss_params"],
+            #     optimizers=self.optimizers["gauss_optimizer"],
+            #     state=self.strategy_state,
+            #     step=step,
+            #     info=info,
+            # )
+
+            # # loss
+            # l1loss = F.l1_loss(colors, pixels)
+            # ssimloss = 1.0 - fused_ssim(
+            #     colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+            # )
+            l1loss = torch.tensor(0.0, device=device)
+            ssimloss = torch.tensor(0.0, device=device)
             loss = l1loss * (1.0 - cfg.ssim_lambda)
             loss += ssimloss * cfg.ssim_lambda
             desc = f"loss={loss.item():.3f}| "
+
+            # lpipsloss = self.lpips(
+            #     colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2)
+            # )
+            # loss += lpipsloss * 0.1
+            # desc += f"lpips loss={lpipsloss.item():.3f}| "
             # if cfg.scale_reg > 0:
             #     scale_loss = info["scales"].mean() * cfg.scale_reg
             #     loss += scale_loss
@@ -764,12 +819,18 @@ class Runner:
                         (gt_points[:, None, :] - points[nn_indices]).norm(dim=-1).mean()
                     )
 
-                asym_chamfer_loss = asym_chamfer(
-                    info["means"],
-                    torch.from_numpy(self.parser.points).float().to(device),
-                ) + asym_chamfer(
-                    torch.from_numpy(self.parser.points).float().to(device),
-                    info["means"],
+                asym_chamfer_loss = (
+                    asym_chamfer(
+                        info["means"],
+                        torch.from_numpy(self.parser.points).float().to(device),
+                        # )
+                    )
+                    + asym_chamfer(
+                        # asym_chamfer_loss = asym_chamfer(
+                        torch.from_numpy(self.parser.points).float().to(device),
+                        info["means"],
+                    )
+                    * 10
                 )
                 loss += asym_chamfer_loss
                 desc += f"asym chamfer loss={asym_chamfer_loss.item():.6f}| "
