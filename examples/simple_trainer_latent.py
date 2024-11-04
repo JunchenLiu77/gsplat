@@ -310,8 +310,13 @@ if __name__ == "__main__":
 
 
 """
-CUDA_VISIBLE_DEVICES=9 python simple_trainer_nocons.py --data_dir ~/dataset/360_v2/garden --data_factor 8 --max_steps 7000 \
+CUDA_VISIBLE_DEVICES=8 python simple_trainer_nocons.py --data_dir ~/dataset/360_v2/garden --data_factor 8 --max_steps 7000 \
   --strategy.refine_stop_iter -1 \
-  --port 8091 \
-  --result_dir results/debug_12500t8_onlychamfer
+  --port 8096 \
+  --result_dir results/debug_160t4
+  
+CUDA_VISIBLE_DEVICES=9 python simple_trainer_nocons_v2.py --data_dir ~/dataset/360_v2/garden --data_factor 8 --max_steps 7000 \
+  --strategy.refine_stop_iter -1 \
+  --port 8097 \
+  --result_dir results/debug
 """

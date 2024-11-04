@@ -4,7 +4,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Callable
 
 import imageio
 import nerfview
@@ -44,48 +44,49 @@ from gsplat.rendering import rasterization
 from gsplat.strategy import ScaffoldStrategy
 
 
-class PositionalEncodingMLP(torch.nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        latent_dim: int,
-        output_dim: int,
-        num_layers: int,
-        num_frequencies: int,
-        use_residual: bool,
-    ):
-        super().__init__()
-        self.num_frequencies = num_frequencies
-        self.use_residual = use_residual
+# class PositionalEncodingMLP(torch.nn.Module):
+#     def __init__(
+#         self,
+#         input_dim: int,
+#         latent_dim: int,
+#         output_dim: int,
+#         num_layers: int,
+#         num_frequencies: int,
+#         use_residual: bool,
+#     ):
+#         super().__init__()
+#         self.num_frequencies = num_frequencies
+#         self.use_residual = use_residual
 
-        layers = []
-        for i in range(num_layers):
-            if i == 0:
-                layers.append(
-                    torch.nn.Linear(input_dim * num_frequencies * 2, latent_dim)
-                )
-            else:
-                layers.append(torch.nn.Linear(latent_dim, latent_dim))
-            layers.append(torch.nn.BatchNorm1d(latent_dim))
-            layers.append(torch.nn.ReLU(True))
-            if use_residual and i > 0:
-                layers.append(ResidualConnection(latent_dim))
+#         layers = []
+#         for i in range(num_layers):
+#             if i == 0:
+#                 layers.append(
+#                     torch.nn.Linear(input_dim * num_frequencies * 2, latent_dim)
+#                 )
+#             else:
+#                 layers.append(torch.nn.Linear(latent_dim, latent_dim))
+#             layers.append(torch.nn.BatchNorm1d(latent_dim))
+#             layers.append(torch.nn.ReLU(True))
+#             if use_residual and i > 0:
+#                 layers.append(ResidualConnection(latent_dim))
 
-        last_layer = torch.nn.Linear(latent_dim, output_dim)
-        torch.nn.init.normal_(last_layer.weight, mean=0.0, std=0.01)
-        torch.nn.init.constant_(last_layer.bias, 0.0)
-        layers.append(last_layer)
+#         last_layer = torch.nn.Linear(latent_dim, output_dim)
+#         torch.nn.init.normal_(last_layer.weight, mean=0.0, std=0.01)
+#         torch.nn.init.constant_(last_layer.bias, 0.0)
+#         layers.append(last_layer)
 
-        self.mlp = torch.nn.Sequential(*layers).cuda()
+#         self.mlp = torch.nn.Sequential(*layers).cuda()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        frequencies = 2.0 ** torch.arange(
-            self.num_frequencies, dtype=torch.float32, device=x.device
-        )
-        x = x.unsqueeze(-1)
-        encoded = (x * frequencies).view(x.shape[0], -1)
-        x = torch.cat([torch.sin(encoded), torch.cos(encoded)], dim=-1)
-        return self.mlp(x)
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         raise NotImplementedError  # this mlp is not enough
+#         frequencies = 2.0 ** torch.arange(
+#             self.num_frequencies, dtype=torch.float32, device=x.device
+#         )
+#         x = x.unsqueeze(-1)
+#         encoded = (x * frequencies).view(x.shape[0], -1)
+#         x = torch.cat([torch.sin(encoded), torch.cos(encoded)], dim=-1)
+#         return self.mlp(x)
 
 
 class MLP(torch.nn.Module):
@@ -96,30 +97,58 @@ class MLP(torch.nn.Module):
         output_dim: int,
         num_layers: int,
         use_residual: bool,
+        hidden_init: Callable = torch.nn.init.kaiming_normal_,
+        output_init: Callable = torch.nn.init.kaiming_normal_,
     ):
         super().__init__()
         self.num_layers = num_layers
         self.use_residual = use_residual
+        self.hidden_init = hidden_init
+        self.output_init = output_init
 
-        layers = []
+        self.hidden_layers = torch.nn.ModuleList()
         for i in range(num_layers):
             if i == 0:
-                layers.append(torch.nn.Linear(input_dim, latent_dim))
+                self.hidden_layers.append(torch.nn.Linear(input_dim, latent_dim))
             else:
-                layers.append(torch.nn.Linear(latent_dim, latent_dim))
-            layers.append(torch.nn.BatchNorm1d(latent_dim))
-            layers.append(torch.nn.ReLU(True))
+                self.hidden_layers.append(torch.nn.Linear(latent_dim, latent_dim))
+            self.hidden_layers.append(torch.nn.BatchNorm1d(latent_dim))
+            self.hidden_layers.append(torch.nn.ReLU(True))
             if use_residual and i > 0:
-                layers.append(ResidualConnection(latent_dim))
+                self.hidden_layers.append(ResidualConnection(latent_dim))
 
-        last_layer = torch.nn.Linear(latent_dim, output_dim)
-        torch.nn.init.normal_(last_layer.weight, mean=0.0, std=0.01)
-        torch.nn.init.constant_(last_layer.bias, 0.0)
-        layers.append(last_layer)
-        self.mlp = torch.nn.Sequential(*layers).cuda()
+        self.output_layer = torch.nn.Linear(latent_dim, output_dim)
+
+    def init_weights(self):
+        """Initialize weights of the MLP layers."""
+        for module in self.hidden_layers:
+            if isinstance(module, torch.nn.Linear):
+                # Kaiming is better
+                if isinstance(self.hidden_init, torch.nn.init.kaiming_normal_):
+                    self.hidden_init(module.weight, nonlinearity="relu")
+                elif isinstance(self.hidden_init, torch.nn.init.normal_):
+                    self.hidden_init(module.weight, mean=0.0, std=0.01)
+                else:
+                    raise AssertionError("Unsupported initialization type")
+                if module.bias is not None:
+                    torch.nn.init.zeros_(module.bias)
+            elif isinstance(module, torch.nn.BatchNorm1d):
+                torch.nn.init.constant_(module.weight, 1)
+                torch.nn.init.constant_(module.bias, 0)
+        if isinstance(self.output_init, torch.nn.init.kaiming_normal_):
+            self.output_init(self.output_layer.weight, nonlinearity="relu")
+        elif isinstance(self.output_init, torch.nn.init.normal_):
+            self.output_init(self.output_layer.weight, mean=0.0, std=0.01)
+        else:
+            raise AssertionError("Unsupported initialization type")
+        if self.output_layer.bias is not None:
+            torch.nn.init.zeros_(self.output_layer.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.mlp(x)
+        x = x.view(x.shape[0], -1)
+        for layer in self.hidden_layers:
+            x = layer(x)
+        return self.output_layer(x)
 
 
 class ResidualConnection(torch.nn.Module):
@@ -157,15 +186,15 @@ class Config:
     # Dimensionality of anchor features
     feat_dim: int = 256
     # Input token dimension
-    input_dim: int = 64
+    input_dim: int = 256
     # Number of layers
     num_layers: int = 6
     # # Number of frequencies
     # num_frequencies: int = 6
     # Number offsets
-    n_feat_offsets: int = 4
+    n_feat_offsets: int = 100
     # Number of gaussians
-    n_gauss: int = 160_000
+    n_gauss: int = 1_000
 
     # Port for the viewer server
     port: int = 8080
@@ -301,7 +330,8 @@ def create_splats_with_optimizers(
         # "scales": 7e-3,
         # "opacities": 5e-2,
         # "offsets": 1e-3,
-        "feature_mlp": 5e-4,
+        "geo_mlp": 5e-4,
+        "app_mlp": 5e-4,
         # "opacities_mlp": 2e-3,
         # "colors_mlp": 1e-2,
         # "scale_rot_mlp": 4e-4,
@@ -320,13 +350,22 @@ def create_splats_with_optimizers(
         }
     ).to(device)
 
-    feature_mlp: torch.nn.Sequential = MLP(
+    geo_mlp: torch.nn.Sequential = MLP(
         input_dim=cfg.input_dim,
-        latent_dim=cfg.feat_dim,
-        output_dim=14
-        * cfg.n_feat_offsets,  # offset[3] + color[3] + opacity[1] + quat[4] + scale[3]
-        num_layers=cfg.num_layers,
+        latent_dim=512,
+        output_dim=3 * cfg.n_feat_offsets,
+        num_layers=4,
         use_residual=True,
+    ).cuda()
+
+    # app_mlp: torch.nn.Sequential = PositionalEncodingMLP(
+    app_mlp: torch.nn.Sequential = MLP(
+        input_dim=3,
+        latent_dim=512,
+        output_dim=11,
+        num_layers=4,
+        use_residual=True,
+        output_init=torch.nn.init.normal_,
     ).cuda()
 
     # # Define the MLPs (decoders)
@@ -357,7 +396,8 @@ def create_splats_with_optimizers(
     # Initialize decoders (MLPs)
     decoders = torch.nn.ModuleDict(
         {
-            "feature_mlp": feature_mlp,
+            "geo_mlp": geo_mlp,
+            "app_mlp": app_mlp,
             # "opacities_mlp": opacities_mlp,
             # "colors_mlp": colors_mlp,
             # "scale_rot_mlp": scale_rot_mlp,
@@ -545,18 +585,27 @@ class Runner:
     ) -> Tuple[Tensor, Tensor, Dict]:
 
         # Get all the gaussians spawned from the anchors
-        features = self.splats["decoders"]["feature_mlp"](
+        # features = self.splats["decoders"]["feature_mlp"](
+        #     self.splats["gauss_params"]["anchors"]
+        # )
+        # features = features.view(-1, self.cfg.n_feat_offsets, 14)
+        # offsets, vis_colors, vis_opacity, quats, scales = features.split(
+        #     [3, 3, 1, 4, 3], dim=-1
+        # )
+        offsets = self.splats["decoders"]["geo_mlp"](
             self.splats["gauss_params"]["anchors"]
         )
-        features = features.view(-1, self.cfg.n_feat_offsets, 14)
-        offsets, vis_colors, vis_opacity, quats, scales = features.split(
-            [3, 3, 1, 4, 3], dim=-1
-        )
-        offsets = offsets.view(-1, 3)
+        offsets = offsets.view(-1, self.cfg.n_feat_offsets, 3).view(-1, 3)
+
+        apps = self.splats["decoders"]["app_mlp"](offsets)
+        apps = apps.view(-1, self.cfg.n_feat_offsets, 11)
+        vis_colors, vis_opacity, quats, scales = apps.split([3, 1, 4, 3], dim=-1)
         vis_colors = vis_colors.view(-1, 3)
         vis_opacity = vis_opacity.view(-1, 1)
         quats = quats.view(-1, 4)
         scales = scales.view(-1, 3)
+
+        scales = torch.clamp(scales, max=1)  # TODO: remove
 
         info = {
             "means": offsets * self.scene_scale * 1.0,
@@ -624,7 +673,11 @@ class Runner:
                 gamma=0.01 ** (1.0 / max_steps),
             ),
             torch.optim.lr_scheduler.ExponentialLR(
-                self.optimizers["decoders_optimizer"]["feature_mlp"],
+                self.optimizers["decoders_optimizer"]["geo_mlp"],
+                gamma=0.01 ** (1.0 / max_steps),
+            ),
+            torch.optim.lr_scheduler.ExponentialLR(
+                self.optimizers["decoders_optimizer"]["app_mlp"],
                 gamma=0.01 ** (1.0 / max_steps),
             ),
         ]
@@ -669,7 +722,7 @@ class Runner:
         # self.splats["decoders"]["scale_rot_mlp"].train()
         # self.splats["decoders"]["opacities_mlp"].train()
         # self.splats["decoders"]["colors_mlp"].train()
-        self.splats["decoders"]["feature_mlp"].train()
+        # self.splats["decoders"]["feature_mlp"].train()
 
         for step in pbar:
             if not cfg.disable_viewer:
@@ -703,66 +756,62 @@ class Runner:
             if cfg.pose_opt:
                 camtoworlds = self.pose_adjust(camtoworlds, image_ids)
 
-            # info = {}
-            # features = self.splats["decoders"]["feature_mlp"](
-            #     self.splats["gauss_params"]["anchors"]
+            info = {}
+            offsets = self.splats["decoders"]["geo_mlp"](
+                self.splats["gauss_params"]["anchors"]
+            )
+            offsets = offsets.view(-1, 3)
+            info["means"] = offsets * self.scene_scale
+            l1loss = torch.tensor(0.0, device=device)
+            ssimloss = torch.tensor(0.0, device=device)
+
+            # # forward
+            # renders, alphas, info = self.rasterize_splats(
+            #     camtoworlds=camtoworlds,
+            #     Ks=Ks,
+            #     width=width,
+            #     height=height,
+            #     sh_degree=None,
+            #     near_plane=cfg.near_plane,
+            #     far_plane=cfg.far_plane,
+            #     render_mode="RGB+ED" if cfg.depth_loss else "RGB",
             # )
-            # features = features.view(-1, self.cfg.n_feat_offsets, 14)
-            # offsets, vis_colors, vis_opacity, quats, scales = features.split(
-            #     [3, 3, 1, 4, 3], dim=-1
+
+            # if renders.shape[-1] == 4:
+            #     colors, depths = renders[..., 0:3], renders[..., 3:4]
+            # else:
+            #     colors, depths = renders, None
+
+            # if cfg.use_bilateral_grid:
+            #     grid_y, grid_x = torch.meshgrid(
+            #         (torch.arange(height, device=self.device) + 0.5) / height,
+            #         (torch.arange(width, device=self.device) + 0.5) / width,
+            #         indexing="ij",
+            #     )
+            #     grid_xy = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
+            #     colors = slice(self.bil_grids, grid_xy, colors, image_ids)["rgb"]
+
+            # if cfg.random_bkgd:
+            #     bkgd = torch.rand(1, 3, device=device)
+            #     colors = colors + bkgd * (1.0 - alphas)
+
+            # self.cfg.strategy.step_pre_backward(
+            #     params=self.splats["gauss_params"],
+            #     optimizers=self.optimizers["gauss_optimizer"],
+            #     state=self.strategy_state,
+            #     step=step,
+            #     info=info,
             # )
-            # offsets = offsets.view(-1, 3)
-            # info["means"] = offsets * self.scene_scale
-            # l1loss = torch.tensor(0.0, device=device)
-            # ssimloss = torch.tensor(0.0, device=device)
 
-            # forward
-            renders, alphas, info = self.rasterize_splats(
-                camtoworlds=camtoworlds,
-                Ks=Ks,
-                width=width,
-                height=height,
-                sh_degree=None,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                render_mode="RGB+ED" if cfg.depth_loss else "RGB",
-            )
-
-            if renders.shape[-1] == 4:
-                colors, depths = renders[..., 0:3], renders[..., 3:4]
-            else:
-                colors, depths = renders, None
-
-            if cfg.use_bilateral_grid:
-                grid_y, grid_x = torch.meshgrid(
-                    (torch.arange(height, device=self.device) + 0.5) / height,
-                    (torch.arange(width, device=self.device) + 0.5) / width,
-                    indexing="ij",
-                )
-                grid_xy = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
-                colors = slice(self.bil_grids, grid_xy, colors, image_ids)["rgb"]
-
-            if cfg.random_bkgd:
-                bkgd = torch.rand(1, 3, device=device)
-                colors = colors + bkgd * (1.0 - alphas)
-
-            self.cfg.strategy.step_pre_backward(
-                params=self.splats["gauss_params"],
-                optimizers=self.optimizers["gauss_optimizer"],
-                state=self.strategy_state,
-                step=step,
-                info=info,
-            )
-
-            # loss
-            l1loss = F.l1_loss(colors, pixels)
-            ssimloss = 1.0 - fused_ssim(
-                colors.permute(0, 3, 1, 2),
-                pixels.permute(0, 3, 1, 2),
-                padding="valid",
-            )
+            # # loss
+            # l1loss = F.l1_loss(colors, pixels)
+            # ssimloss = 1.0 - fused_ssim(
+            #     colors.permute(0, 3, 1, 2),
+            #     pixels.permute(0, 3, 1, 2),
+            #     padding="valid",
+            # )
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
-            loss *= 0.1
+            # loss *= 0.1
             desc = f"loss={loss.item():.3f}| "
 
             # lpipsloss = self.lpips(
@@ -823,18 +872,14 @@ class Runner:
                         (gt_points[:, None, :] - points[nn_indices]).norm(dim=-1).mean()
                     )
 
-                asym_chamfer_loss = (
-                    asym_chamfer(
-                        info["means"],
-                        torch.from_numpy(self.parser.points).float().to(device),
-                        # )
-                    )
-                    + asym_chamfer(
-                        # asym_chamfer_loss = asym_chamfer(
-                        torch.from_numpy(self.parser.points).float().to(device),
-                        info["means"],
-                    )
-                    * 0.1
+                asym_chamfer_loss = asym_chamfer(
+                    info["means"],
+                    torch.from_numpy(self.parser.points).float().to(device),
+                    # )
+                ) + asym_chamfer(
+                    # asym_chamfer_loss = asym_chamfer(
+                    torch.from_numpy(self.parser.points).float().to(device),
+                    info["means"],
                 )
                 loss += asym_chamfer_loss
                 desc += f"asym chamfer loss={asym_chamfer_loss.item():.6f}| "
