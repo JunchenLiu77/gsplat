@@ -151,7 +151,7 @@ class Config:
     render_traj_path: str = "ellipse"
     tb_every: int = 100
     tb_save_image: bool = False
-    lpips_net: Literal["vgg", "alex"] = "vgg"
+    lpips_net: Literal["vgg", "alex"] = "alex"
     port: int = 8080
     batch_size: int = 1
     max_steps: int = 30_000
@@ -167,22 +167,25 @@ class Config:
     far_plane: float = 1e10
 
     # Model
-    feat_dim: int = 256
+    feat_dim: int = 512
     input_dim: int = 256
-    num_layers: int = 6
+    geo_num_layers: int = 4
+    app_num_layers: int = 4
     n_feat_offsets: int = 10
     n_gauss: int = 10_000
+    warmup_steps: int = 2_000
+    warmup_ckpt: Optional[str] = "results/warmup_10k10.pth"
 
     # Loss
-    ssim_lambda: float = 0.2
-    scale_reg: float = 0.01
-    opacity_reg: float = 0.01
-    offset_reg: float = 0.1
-    depth_loss: bool = False
+    ssim_lambda: float = 2e-1
+    scale_lambda: float = 1e-2
+    opacity_lambda: float = 0
     depth_lambda: float = 1e-2
-    chamfer_lambda: float = 1e-2
-    photo_loss_lambda: float = 0
-    lr: float = 5e-4
+    chamfer_lambda: float = 1e0
+    photo_loss_lambda: float = 1e-1
+    lpips_lambda: float = 0  # don't count on this!!!
+    warmup_lr: float = 5e-4
+    lr: float = 1e-5
 
 
 def create_splats_with_optimizers(
@@ -194,7 +197,6 @@ def create_splats_with_optimizers(
 ) -> tuple[
     dict[str, ModuleDict | ParameterDict], dict[str, dict[str, SparseAdam | Adam]]
 ]:
-    # Define gauss_params
     gauss_params = torch.nn.ParameterDict(
         {
             "anchors": torch.nn.Parameter(
@@ -202,24 +204,20 @@ def create_splats_with_optimizers(
             )
         }
     ).to(device)
-
     geo_mlp: torch.nn.Sequential = MLP(
         input_dim=cfg.input_dim,
-        latent_dim=512,
+        latent_dim=cfg.feat_dim,
         output_dim=3 * cfg.n_feat_offsets,
-        num_layers=4,
+        num_layers=cfg.geo_num_layers,
     ).cuda()
     pos_enc = PositionalEncoding(num_bases=10, include_input=True).cuda()
-
     app_mlp: torch.nn.Sequential = MLP(
         input_dim=pos_enc.output_dim,
-        latent_dim=512,
+        latent_dim=cfg.feat_dim,
         output_dim=11,
-        num_layers=4,
+        num_layers=cfg.app_num_layers,
         output_init=torch.nn.init.normal_,
     ).cuda()
-
-    # Initialize decoders (MLPs)
     decoders = torch.nn.ModuleDict(
         {
             "geo_mlp": geo_mlp,
@@ -227,6 +225,13 @@ def create_splats_with_optimizers(
             "app_mlp": app_mlp,
         }
     ).to(device)
+    splats = {"gauss_params": gauss_params, "decoders": decoders}
+    if cfg.warmup_ckpt is not None:
+        ckpt = torch.load(cfg.warmup_ckpt, map_location=device)
+        splats["gauss_params"]["anchors"].data = ckpt["gauss_params"]["anchors"].data
+        for k in splats["decoders"].keys():
+            splats["decoders"][k].load_state_dict(ckpt["decoders"][k].state_dict())
+        print(f"[info] Loaded warm-up checkpoint from {cfg.warmup_ckpt}")
 
     # Scale learning rates based on batch size (BS)
     BS = batch_size * world_size
@@ -263,7 +268,6 @@ def create_splats_with_optimizers(
     }
 
     # Return the gauss_params, decoders, and the dictionary of dictionaries for optimizers
-    splats = {"gauss_params": gauss_params, "decoders": decoders}
     return splats, optimizers
 
 
@@ -306,7 +310,7 @@ class Runner:
             self.parser,
             split="train",
             patch_size=cfg.patch_size,
-            load_depths=cfg.depth_loss,
+            load_depths=True,
         )
         self.valset = Dataset(self.parser, split="val")
         self.sfm_points = torch.from_numpy(self.parser.points).float().to(self.device)
@@ -392,11 +396,55 @@ class Runner:
         raster_info.update(info)
         return render_colors, render_alphas, raster_info
 
+    def warmup(self):
+        """
+        In warm-up stage, we only optimize the anchors and geo_mlp for better initialization.
+        """
+        print("[info] Starting warm-up")
+        warmup_optimizer = torch.optim.Adam(
+            [
+                {
+                    "params": [
+                        *self.splats["decoders"]["geo_mlp"].parameters(),
+                        self.splats["gauss_params"]["anchors"],
+                    ],
+                    "lr": self.cfg.warmup_lr,
+                }
+            ],
+            eps=1e-15,
+            betas=(1 - 0.9, 1 - 0.999),
+        )
+        warmup_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+            warmup_optimizer, gamma=0.01 ** (1.0 / self.cfg.warmup_steps)
+        )
+        pbar = tqdm.tqdm(range(self.cfg.warmup_steps))
+        for step in pbar:
+            offsets = self.splats["decoders"]["geo_mlp"](
+                self.splats["gauss_params"]["anchors"]
+            )
+            offsets = offsets.view(-1, self.cfg.n_feat_offsets, 3).view(-1, 3)
+            means = offsets * self.scene_scale * 1.0
+            loss = 20 * asym_chamfer(means, self.sfm_points) + asym_chamfer(
+                self.sfm_points, means
+            )
+            pbar.set_description(f"chamfer loss={loss.item():.6f}")
+
+            loss.backward()
+            warmup_optimizer.step()
+            warmup_optimizer.zero_grad(set_to_none=True)
+            warmup_scheduler.step()
+        torch.save(self.splats, f"{self.ckpt_dir}/warmup.pth")
+        print(f"[info] Warm-up done, chamfer loss: {loss.item():.6f}")
+        print(f"[info] Warm-up checkpoint saved to {self.ckpt_dir}/warmup.pth")
+
     def train(self):
         cfg = self.cfg
         device = self.device
         world_rank = self.world_rank
         world_size = self.world_size
+
+        if cfg.warmup_ckpt is None:
+            self.warmup()
 
         # Dump cfg.
         if world_rank == 0:
@@ -454,9 +502,8 @@ class Runner:
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
             image_ids = data["image_id"].to(device)
-            if cfg.depth_loss:
-                points = data["points"].to(device)  # [1, M, 2]
-                depths_gt = data["depths"].to(device)  # [1, M]
+            points = data["points"].to(device)  # [1, M, 2]
+            depths_gt = data["depths"].to(device)  # [1, M]
 
             height, width = pixels.shape[1:3]
 
@@ -469,7 +516,7 @@ class Runner:
                 sh_degree=None,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
-                render_mode="RGB+ED" if cfg.depth_loss else "RGB",
+                render_mode="RGB+ED",
             )
 
             if renders.shape[-1] == 4:
@@ -488,26 +535,21 @@ class Runner:
             loss *= cfg.photo_loss_lambda
             desc = f"loss={loss.item():.3f}| "
 
-            # lpipsloss = self.lpips(
-            #     colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2)
-            # )
-            # loss += lpipsloss * 0.1
-            # desc += f"lpips loss={lpipsloss.item():.3f}| "
-            # if cfg.scale_reg > 0:
-            #     scale_loss = info["scales"].mean() * cfg.scale_reg
-            #     loss += scale_loss
-            #     desc += f"scale loss={scale_loss.item():.6f}| "
-            # if cfg.opacity_reg > 0:
-            #     opacity_loss = (1 - info["opacities"]).mean() * cfg.opacity_reg
-            #     # opacity_loss = info["opacities"].mean() * cfg.opacity_reg
-            #     loss += opacity_loss
-            #     desc += f"opacity loss={opacity_loss.item():.6f}| "
-            # if cfg.offset_reg > 0:
-            #     offset_loss = info["offsets"].norm(dim=-1).mean() * cfg.offset_reg
-            #     loss += offset_loss
-            #     desc += f"offset loss={offset_loss.item():.6f}| "
-
-            if cfg.depth_loss:
+            if cfg.lpips_lambda > 0:
+                lpipsloss = self.lpips(
+                    colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2)
+                )
+                loss += lpipsloss * cfg.lpips_lambda
+                desc += f"lpips loss={lpipsloss.item():.3f}| "
+            if cfg.scale_lambda > 0:
+                scale_loss = info["scales"].mean() * cfg.scale_lambda
+                loss += scale_loss
+                desc += f"scale loss={scale_loss.item():.6f}| "
+            if cfg.opacity_lambda > 0:
+                opacity_loss = (1 - info["opacities"]).mean()
+                loss += opacity_loss * cfg.opacity_lambda
+                desc += f"opacity loss={opacity_loss.item():.6f}| "
+            if cfg.depth_lambda > 0:
                 # query depths from depth map
                 points = torch.stack(
                     [
@@ -526,17 +568,15 @@ class Runner:
                 disp_gt = 1.0 / depths_gt  # [1, M]
                 depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
                 loss += depthloss * cfg.depth_lambda
+                desc += f"depth loss={depthloss.item():.6f}| "
 
-            asym_chamfer_loss = asym_chamfer(
-                info["means"], self.sfm_points
-            ) + asym_chamfer(self.sfm_points, info["means"])
-            loss += asym_chamfer_loss * cfg.chamfer_lambda
-            desc += f"chamfer loss={asym_chamfer_loss.item():.6f}| "
+            chamfer_loss = asym_chamfer(info["means"], self.sfm_points) + asym_chamfer(
+                self.sfm_points, info["means"]
+            )
+            loss += chamfer_loss * cfg.chamfer_lambda
+            desc += f"chamfer loss={chamfer_loss.item():.6f}| "
 
             loss.backward()
-
-            if cfg.depth_loss:
-                desc += f"depth loss={depthloss.item():.6f}| "
             pbar.set_description(desc)
 
             if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
@@ -546,8 +586,6 @@ class Runner:
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
                 self.writer.add_scalar("train/num_GS", len(info["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
-                if cfg.depth_loss:
-                    self.writer.add_scalar("train/depthloss", depthloss.item(), step)
                 self.writer.flush()
 
             # optimize
