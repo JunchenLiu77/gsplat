@@ -36,18 +36,22 @@ from gsplat.distributed import cli
 from gsplat.rendering import rasterization
 from pykeops.torch import generic_argkmin
 
-knn1 = generic_argkmin(
-    "SqDist(x, y)",
-    "a = Vi(1)",
-    "x = Vi(3)",
-    "y = Vj(3)",
-)
+
+def argkmin_wrapper(metric: str, k: int):
+    return generic_argkmin(metric, f"a = Vi({k})", "x = Vi(3)", "y = Vj(3)")
 
 
-def asym_chamfer(pc1, pc2):
+argkmin1 = {
+    1: argkmin_wrapper("Sum(Abs(x - y))", 1),
+    2: argkmin_wrapper("SqDist(x, y)", 1),
+}
+
+
+def asym_chamfer(pc1, pc2, p=1):
     # encourage pc2 to approach pc1
-    nn_indices = knn1(pc2, pc1)  # [N, 4]
-    return (pc2[:, None, :] - pc1[nn_indices]).norm(dim=-1).mean()
+    assert p in [1, 2], p
+    nn_indices = argkmin1[p](pc2, pc1)  # [N, 1]
+    return (pc2[:, None, :] - pc1[nn_indices]).norm(dim=-1, p=p).mean()
 
 
 class PositionalEncoding(torch.nn.Module):
@@ -174,7 +178,7 @@ class Config:
     n_feat_offsets: int = 10
     n_gauss: int = 10_000
     warmup_steps: int = 2_000
-    warmup_ckpt: Optional[str] = "results/warmup_10k10.pth"
+    warmup_ckpt: Optional[str] = None  # "results/warmup_10k10.pth"
 
     # Loss
     ssim_lambda: float = 2e-1
@@ -184,7 +188,7 @@ class Config:
     chamfer_lambda: float = 1e0
     photo_loss_lambda: float = 1e-1
     lpips_lambda: float = 0  # don't count on this!!!
-    warmup_lr: float = 5e-4
+    warmup_lr: float = 1e-3
     lr: float = 1e-5
 
 
@@ -445,6 +449,7 @@ class Runner:
 
         if cfg.warmup_ckpt is None:
             self.warmup()
+            return
 
         # Dump cfg.
         if world_rank == 0:
