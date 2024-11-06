@@ -37,16 +37,14 @@ from gsplat.rendering import rasterization
 from pykeops.torch import generic_argkmin
 
 
-def argkmin_fn(k: int, p: int):
-    assert p in [1, 2], p
-    metric = {
-        1: "Sum(Abs(x - y))",
-        2: "SqDist(x, y)",
-    }
-    return generic_argkmin(metric[p], f"a = Vi({k})", "x = Vi(3)", "y = Vj(3)")
-
-
-def asym_chamfer(pc1, pc2, p=2, hyperbolic=True, alpha=0.2):
+def asym_chamfer(
+    pc1,
+    pc2,
+    k=1,
+    p=2,
+    hyperbolic=False,
+    alpha=0.2,
+):
     """
     Chamfer distance support different distance metrics
     - hyperbolic=False: use L1/L2 distance
@@ -54,7 +52,18 @@ def asym_chamfer(pc1, pc2, p=2, hyperbolic=True, alpha=0.2):
     https://openaccess.thecvf.com/content/ICCV2023/papers/Lin_Hyperbolic_Chamfer_Distance_for_Point_Cloud_Completion_ICCV_2023_paper.pdf
     """
     assert p in [1, 2], p
-    nn_indices = argkmin_fn(1, p)(pc2, pc1)  # [N, 1]
+    metric = {
+        1: "Sum(Abs(x - y))",
+        2: "SqDist(x, y)",
+    }
+    nn_indices = generic_argkmin(
+        metric[p],
+        f"a = Vi({k})",
+        "x = Vi(3)",
+        "y = Vj(3)",
+    )(
+        pc2, pc1
+    )  # [N, K]
     dist = (pc2[:, None, :] - pc1[nn_indices]).norm(dim=-1, p=p)
     if not hyperbolic:
         return dist.mean()
@@ -184,7 +193,7 @@ class Config:
     geo_num_layers: int = 4
     app_num_layers: int = 4
     n_feat_offsets: int = 10
-    n_gauss: int = 10_000
+    n_gauss: int = 40_000
     warmup_steps: int = 2_000
     warmup_ckpt: Optional[str] = None  # "results/warmup_10k10.pth"
 
@@ -436,8 +445,8 @@ class Runner:
             )
             offsets = offsets.view(-1, self.cfg.n_feat_offsets, 3).view(-1, 3)
             means = offsets * self.scene_scale * 1.0
-            loss = 20 * asym_chamfer(means, self.sfm_points) + asym_chamfer(
-                self.sfm_points, means
+            loss = 20 * asym_chamfer(means, self.sfm_points, k=4) + asym_chamfer(
+                self.sfm_points, means, k=1
             )
             pbar.set_description(f"chamfer loss={loss.item():.6f}")
 
