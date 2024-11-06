@@ -47,11 +47,20 @@ argkmin1 = {
 }
 
 
-def asym_chamfer(pc1, pc2, p=1):
-    # encourage pc2 to approach pc1
+def asym_chamfer(pc1, pc2, p=2, hyperbolic=True, alpha=0.2):
+    """
+    Chamfer distance support different distance metrics
+    - hyperbolic=False: use L1/L2 distance
+    - hyperbolic=True: use hyperbolic chamfer distance as described in
+    https://openaccess.thecvf.com/content/ICCV2023/papers/Lin_Hyperbolic_Chamfer_Distance_for_Point_Cloud_Completion_ICCV_2023_paper.pdf
+    """
     assert p in [1, 2], p
     nn_indices = argkmin1[p](pc2, pc1)  # [N, 1]
-    return (pc2[:, None, :] - pc1[nn_indices]).norm(dim=-1, p=p).mean()
+    dist = (pc2[:, None, :] - pc1[nn_indices]).norm(dim=-1, p=p)
+    if not hyperbolic:
+        return dist.mean()
+    else:
+        return torch.acosh(1.0 + alpha * dist).mean()
 
 
 class PositionalEncoding(torch.nn.Module):
@@ -437,8 +446,12 @@ class Runner:
             warmup_optimizer.step()
             warmup_optimizer.zero_grad(set_to_none=True)
             warmup_scheduler.step()
-        torch.save(self.splats, f"{self.ckpt_dir}/warmup.pth")
+        # use standard l1 chamfer distance to eval
+        loss = asym_chamfer(
+            means, self.sfm_points, p=1, hyperbolic=False
+        ) + asym_chamfer(self.sfm_points, means, p=1, hyperbolic=False)
         print(f"[info] Warm-up done, chamfer loss: {loss.item():.6f}")
+        torch.save(self.splats, f"{self.ckpt_dir}/warmup.pth")
         print(f"[info] Warm-up checkpoint saved to {self.ckpt_dir}/warmup.pth")
 
     def train(self):
