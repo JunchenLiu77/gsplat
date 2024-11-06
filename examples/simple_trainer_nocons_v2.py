@@ -445,9 +445,9 @@ class Runner:
             )
             offsets = offsets.view(-1, self.cfg.n_feat_offsets, 3).view(-1, 3)
             means = offsets * self.scene_scale * 1.0
-            loss = 20 * asym_chamfer(means, self.sfm_points, k=4) + asym_chamfer(
-                self.sfm_points, means, k=1
-            )
+            loss = 20 * asym_chamfer(
+                means, self.sfm_points, k=int(math.ceil(offsets.shape[0] / 100_000))
+            ) + asym_chamfer(self.sfm_points, means, k=1)
             pbar.set_description(f"chamfer loss={loss.item():.6f}")
 
             loss.backward()
