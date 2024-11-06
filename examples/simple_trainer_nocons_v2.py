@@ -37,14 +37,13 @@ from gsplat.rendering import rasterization
 from pykeops.torch import generic_argkmin
 
 
-def argkmin_wrapper(metric: str, k: int):
-    return generic_argkmin(metric, f"a = Vi({k})", "x = Vi(3)", "y = Vj(3)")
-
-
-argkmin1 = {
-    1: argkmin_wrapper("Sum(Abs(x - y))", 1),
-    2: argkmin_wrapper("SqDist(x, y)", 1),
-}
+def argkmin_fn(k: int, p: int):
+    assert p in [1, 2], p
+    metric = {
+        1: "Sum(Abs(x - y))",
+        2: "SqDist(x, y)",
+    }
+    return generic_argkmin(metric[p], f"a = Vi({k})", "x = Vi(3)", "y = Vj(3)")
 
 
 def asym_chamfer(pc1, pc2, p=2, hyperbolic=True, alpha=0.2):
@@ -55,7 +54,7 @@ def asym_chamfer(pc1, pc2, p=2, hyperbolic=True, alpha=0.2):
     https://openaccess.thecvf.com/content/ICCV2023/papers/Lin_Hyperbolic_Chamfer_Distance_for_Point_Cloud_Completion_ICCV_2023_paper.pdf
     """
     assert p in [1, 2], p
-    nn_indices = argkmin1[p](pc2, pc1)  # [N, 1]
+    nn_indices = argkmin_fn(1, p)(pc2, pc1)  # [N, 1]
     dist = (pc2[:, None, :] - pc1[nn_indices]).norm(dim=-1, p=p)
     if not hyperbolic:
         return dist.mean()
