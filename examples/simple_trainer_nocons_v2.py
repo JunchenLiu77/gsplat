@@ -195,7 +195,7 @@ class Config:
     n_feat_offsets: int = 10
     n_gauss: int = 40_000
     warmup_steps: int = 2_000
-    warmup_ckpt: Optional[str] = None  # "results/warmup_10k10.pth"
+    warmup_ckpt: Optional[str] = "results/warmup_40k10.pth"
 
     # Loss
     ssim_lambda: float = 2e-1
@@ -206,7 +206,7 @@ class Config:
     photo_loss_lambda: float = 1e-1
     lpips_lambda: float = 0  # don't count on this!!!
     warmup_lr: float = 1e-3
-    lr: float = 1e-5
+    lr: float = 4e-5
 
 
 def create_splats_with_optimizers(
@@ -470,7 +470,6 @@ class Runner:
 
         if cfg.warmup_ckpt is None:
             self.warmup()
-            return
 
         # Dump cfg.
         if world_rank == 0:
@@ -596,9 +595,11 @@ class Runner:
                 loss += depthloss * cfg.depth_lambda
                 desc += f"depth loss={depthloss.item():.6f}| "
 
-            chamfer_loss = asym_chamfer(info["means"], self.sfm_points) + asym_chamfer(
-                self.sfm_points, info["means"]
-            )
+            chamfer_loss = asym_chamfer(
+                info["means"],
+                self.sfm_points,
+                k=int(math.ceil(info["means"].shape[0] / 100_000)),
+            ) + asym_chamfer(self.sfm_points, info["means"], k=1)
             loss += chamfer_loss * cfg.chamfer_lambda
             desc += f"chamfer loss={chamfer_loss.item():.6f}| "
 
